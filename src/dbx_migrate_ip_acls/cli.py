@@ -789,8 +789,21 @@ def _run_acl(cfg: AclConfig, conn: Connection, yes: bool) -> None:
     )
     wc = _confirm_workspace(conn, yes)
 
-    # Read the workspace's IP access lists + enforcement state up front, and decide whether there's
-    # anything to migrate at all (the quadrant gate may exit cleanly).
+    # Account access is always needed — the pre-checks (PAS / VPC endpoints / existing assigned
+    # policy), the name-uniqueness check, and the apply itself are all account-level — and it's the
+    # fastest way to abort. So resolve the account_id + client and run the pre-checks right after the
+    # workspace is confirmed, BEFORE reading and rendering the (potentially large) IP access list
+    # table or prompting about disabled lists. That way an unsupported workspace (PrivateLink) or an
+    # existing enforced CBI policy fails fast, instead of after the user has scrolled the ACL table,
+    # picked disabled rules, and entered an account_id.
+    ws_id = wc.get_workspace_id()
+    _ensure_account_id(conn, "Migrating an IP ACL (checks PrivateLink + the existing assigned policy)")
+    account = _account_client_or_exit(conn)
+    # An existing assigned policy is only replaced if we're going to assign the new one.
+    _acl_preflight(account, ws_id, will_assign=cfg.create_policy and cfg.auto_assign, yes=yes)
+
+    # Read the workspace's IP access lists + enforcement state, and decide whether there's anything
+    # to migrate at all (the quadrant gate may exit cleanly).
     analysis = acl_core.analyze(cfg, wc)
     _acl_ip_gate(analysis, wc, yes, cfg.create_policy)
     # Flag any individually-disabled lists and offer to re-enable + include them (may re-read).
@@ -802,14 +815,6 @@ def _run_acl(cfg: AclConfig, conn: Connection, yes: bool) -> None:
             "there are no enabled rules to migrate.",
         )
         raise typer.Exit(code=0)
-
-    # migrate-acl always needs account access: the pre-checks (PAS / VPC endpoints / existing policy)
-    # and the name-uniqueness check are account-level, and applying needs it anyway.
-    _ensure_account_id(conn, "Migrating an IP ACL (checks PrivateLink + the existing assigned policy)")
-    account = _account_client_or_exit(conn)
-    ws_id = analysis.workspace_id
-    # An existing assigned policy is only replaced if we're going to assign the new one.
-    _acl_preflight(account, ws_id, will_assign=cfg.create_policy and cfg.auto_assign, yes=yes)
 
     _resolve_policy_name(cfg, conn, wc, yes)
     _ensure_acl_policy_name_unique(cfg, account, ws_id, yes)

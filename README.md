@@ -83,19 +83,20 @@ flowchart LR
 flowchart TD
     A(["dbx-migrate-ip-acls"]) --> B{"Confirm target workspace?"}
     B -->|no| X1["Abort — nothing written"]
-    B -->|yes| GATE{"enableIpAccessLists × rule count<br/>(read IP access lists up front)"}
-    GATE -->|"enabled + 0 rules"| X4["No rules — nothing to migrate, stop"]
-    GATE -->|"disabled + 0 rules"| X4
-    GATE -->|"disabled + rules → enable & continue"| REEN["Set enableIpAccessLists=true — continue"]
-    GATE -->|"disabled + rules → decline / --yes"| X6["Not active — nothing to migrate, stop"]
-    REEN --> PAS
-    GATE -->|"enabled + 1+ rules"| PAS{"PrivateLink? (PAS attached<br/>or workspace VPC endpoints > 0)"}
+    B -->|yes| ACCT["Account access (prompt account_id)<br/>run pre-checks before reading the IP ACLs"]
+    ACCT --> PAS{"PrivateLink? (PAS attached<br/>or workspace VPC endpoints > 0)"}
     PAS -->|yes| X2["ABORT — not supported yet"]
     PAS -->|no| AS0{"Will create AND assign?"}
     AS0 -->|"yes: existing ENFORCED CBI policy"| X3["ABORT"]
     AS0 -->|"yes: existing DRY-RUN CBI policy"| PROM["Warn; offer to promote to enforced, then stop"]
-    AS0 -->|"yes: none / allow-all"| NAME["Resolve policy name (prompt; blank = profile)<br/>must be unique — re-prompt if it exists"]
-    AS0 -->|"no: propose-only"| NAME
+    AS0 -->|"yes: none / allow-all"| GATE{"enableIpAccessLists × rule count<br/>(read IP access lists)"}
+    AS0 -->|"no: propose-only"| GATE
+    GATE -->|"enabled + 0 rules"| X4["No rules — nothing to migrate, stop"]
+    GATE -->|"disabled + 0 rules"| X4
+    GATE -->|"disabled + rules → enable & continue"| REEN["Set enableIpAccessLists=true — continue"]
+    GATE -->|"disabled + rules → decline / --yes"| X6["Not active — nothing to migrate, stop"]
+    REEN --> NAME
+    GATE -->|"enabled + 1+ rules"| NAME["Resolve policy name (prompt; blank = profile)<br/>must be unique — re-prompt if it exists"]
     NAME --> RD["ALLOW → allow, BLOCK → deny (IPv4, ENABLED only)<br/>labels verbatim; disabled lists flagged, not migrated"]
     RD --> P["Preview proposed policy + disabled-rule notice"]
     P --> EXP{"--export?"}
@@ -126,26 +127,28 @@ flowchart TD
 
 ## 🧰 What it does
 
-1. **Right after the workspace is chosen**, decides whether there's anything to migrate, from the
-   workspace-wide `enableIpAccessLists` toggle × the number of IP access lists:
+1. **Right after the workspace is chosen** — and *before* the IP access lists are read or shown —
+   runs account-level **pre-checks**, so an unsupported or already-migrated workspace fails fast. It
+   prompts for the `account_id` if it wasn't passed, then aborts on **PrivateLink** (a PAS object
+   attached, or ≥1 registered VPC endpoint for this workspace — not supported yet); and, only when
+   the run will **assign** the new policy, guards an existing **restrictive** CBI ingress policy
+   already bound to the workspace (enforced → abort; dry-run → offer to promote it to enforced, then
+   stop). An allow-all policy such as the account's baseline `default-policy` is ignored.
+2. Then decides whether there's anything to migrate, from the workspace-wide `enableIpAccessLists`
+   toggle × the number of IP access lists:
    - **disabled + 0 rules** → nothing to migrate → exit.
    - **disabled + 1+ rules** → the rules aren't in effect. It prints the current IP-ACL config and
      (interactively) offers to **enable** them: **yes** → sets `enableIpAccessLists=true` and
      **continues** in the same run; **no** → exits. `--yes` never auto-flips the toggle.
    - **enabled + 0 rules** → nothing to migrate → exit.
    - **enabled + 1+ rules** → proceed. (Unreadable toggle → warn + proceed.)
-2. Reads the workspace's IP access lists (`w.ip_access_lists.list()`). **Individual lists that are
+3. Reads the workspace's IP access lists (`w.ip_access_lists.list()`). **Individual lists that are
    disabled are flagged and NOT migrated** — only enabled lists are; the disabled ones are called
    out in the final printout so you can vet them. Maps **ALLOW → allow rules**, **BLOCK → deny
    rules** (IPv4 only; CBI is IPv4-only), recreating each rule **verbatim** — the original ACL
    label, no prefix, no mode suffix. The one thing it adds: if the ACL has **only BLOCK lists**, a
    catch-all allow (all public IPs) is added, because CBI RESTRICTED_ACCESS is default-deny —
    without it a deny-only policy would block everything.
-3. Runs account-level **pre-checks**: aborts on **PrivateLink** (a PAS object attached, or ≥1
-   registered VPC endpoint for this workspace — not supported yet); and, only when the run will
-   **assign** the new policy, guards an existing **restrictive** CBI ingress policy already bound to
-   the workspace (enforced → abort; dry-run → offer to promote it to enforced, then stop). An
-   allow-all policy such as the account's baseline `default-policy` is ignored.
 4. Names the new policy from `--policy-name` (or prompts; blank = the profile name). It only
    **creates new** policies, so a name that already exists re-prompts (or aborts non-interactively).
    `--create-policy` is **on by default** (a review gate still confirms); with `--auto-assign`
