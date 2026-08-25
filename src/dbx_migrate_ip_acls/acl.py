@@ -92,17 +92,36 @@ def analyze(cfg: AclConfig, workspace_client) -> AclAnalysis:
     )
 
 
-def workspace_cloud(account, workspace_id) -> str | None:
-    """This workspace's cloud — 'aws', 'azure', or 'gcp' — read from the account workspaces API and
-    lower-cased. This is an authoritative API field (not parsed from the workspace host URL, which
-    could change), used to skip the PrivateLink pre-checks on Azure. None if it couldn't be
-    determined; best-effort so a read failure degrades to a warning/default rather than a crash."""
+def cloud_from_host(host: str | None) -> str | None:
+    """Infer the cloud — 'aws', 'azure', or 'gcp' — from a Databricks host URL by its domain. None if
+    the host is empty or doesn't match a known Databricks domain. Used as a fallback when the account
+    API doesn't populate the `cloud` field (it often doesn't)."""
+    h = (host or "").lower()
+    if not h:
+        return None
+    if "azuredatabricks.net" in h:
+        return "azure"
+    if "gcp.databricks.com" in h:
+        return "gcp"
+    if "cloud.databricks.com" in h:  # the AWS domain (also the account host accounts.cloud.databricks.com)
+        return "aws"
+    return None
+
+
+def workspace_cloud(account, workspace_id, host: str | None = None) -> str | None:
+    """This workspace's cloud — 'aws', 'azure', or 'gcp'. Prefers the authoritative `cloud` field on
+    the account workspaces API; when that's empty (it frequently is — e.g. AWS workspaces report no
+    cloud), falls back to inferring it from the workspace `host` URL's domain. None if neither yields
+    an answer. Used to drive per-cloud behaviour (today: skipping the PrivateLink pre-checks on
+    Azure). Best-effort — a read failure degrades to the host fallback rather than crashing."""
     try:
         ws = account.workspaces.get(workspace_id=int(workspace_id))
         cloud = (getattr(ws, "cloud", None) or "").strip().lower()
-        return cloud or None
-    except Exception:  # noqa: BLE001 - couldn't determine; caller defaults to non-Azure (checks stay on)
-        return None
+        if cloud:
+            return cloud
+    except Exception:  # noqa: BLE001 - couldn't read the API field; fall back to the host below
+        pass
+    return cloud_from_host(host)
 
 
 def workspace_pas_attached(account, workspace_id) -> bool | None:

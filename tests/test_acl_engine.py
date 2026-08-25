@@ -201,14 +201,39 @@ def _cloud_account(cloud, raise_=False):
     return type("Acct", (), {"workspaces": _WS()})()
 
 
-def test_workspace_cloud_reads_api_field():
-    # authoritative API field (not host-parsed), normalised to lower-case
+def test_cloud_from_host_maps_all_three_clouds():
+    assert acl_core.cloud_from_host("https://adb-123.4.azuredatabricks.net") == "azure"
+    assert acl_core.cloud_from_host("https://x.gcp.databricks.com") == "gcp"
+    assert acl_core.cloud_from_host("https://dbc-abc.cloud.databricks.com") == "aws"
+    assert acl_core.cloud_from_host("https://sfe-csp.cloud.databricks.com") == "aws"
+    assert acl_core.cloud_from_host("") is None
+    assert acl_core.cloud_from_host(None) is None
+    assert acl_core.cloud_from_host("https://example.com") is None
+
+
+def test_workspace_cloud_prefers_api_field():
+    # the authoritative API field wins (normalised to lower-case), even if a host is also given
     assert acl_core.workspace_cloud(_cloud_account("azure"), 42) == "azure"
     assert acl_core.workspace_cloud(_cloud_account("AWS"), 42) == "aws"
     assert acl_core.workspace_cloud(_cloud_account("gcp"), 42) == "gcp"
-    # missing / unreadable -> None (caller defaults to non-Azure, so the PrivateLink checks stay on)
+    assert acl_core.workspace_cloud(_cloud_account("gcp"), 42, host="https://x.azuredatabricks.net") == "gcp"
+
+
+def test_workspace_cloud_falls_back_to_host_when_api_empty_or_unreadable():
+    # API field empty -> infer from the host (all three clouds)
+    assert acl_core.workspace_cloud(_cloud_account(None), 42, host="https://x.azuredatabricks.net") == "azure"
+    assert acl_core.workspace_cloud(_cloud_account(None), 42, host="https://x.gcp.databricks.com") == "gcp"
+    assert acl_core.workspace_cloud(_cloud_account(None), 42, host="https://x.cloud.databricks.com") == "aws"
+    # API read raises -> still fall back to the host
+    assert (
+        acl_core.workspace_cloud(
+            _cloud_account("azure", raise_=True), 42, host="https://x.cloud.databricks.com"
+        )
+        == "aws"
+    )
+    # neither API nor host yields an answer -> None (caller defaults to non-Azure; checks stay on)
     assert acl_core.workspace_cloud(_cloud_account(None), 42) is None
-    assert acl_core.workspace_cloud(_cloud_account("azure", raise_=True), 42) is None
+    assert acl_core.workspace_cloud(_cloud_account(None), 42, host=None) is None
 
 
 def test_workspace_pas_attached_true_false():
