@@ -49,11 +49,12 @@ options go straight after the program name.
    entirely on Azure** (the cloud is resolved from the account workspaces API `cloud` field, falling
    back to the workspace host's domain when the API doesn't populate it) — an Azure workspace has
    neither a Private Access Settings object nor VPC endpoints, so it only needs its IP ACLs migrated:
-   - **PAS attached?** If the workspace has a Private Access Settings object (AWS/GCP front-end
+   - **PAS attached?** If **this workspace** has a Private Access Settings object (front-end
      PrivateLink), migration to CBI isn't supported yet — it **aborts**.
-   - **Registered VPC endpoints?** If **this workspace** has ≥1 registered VPC (PrivateLink) endpoint
-     — via its network config's back-end endpoints — it **aborts** too. (Account-wide endpoints
-     belonging to *other* workspaces don't count.)
+   - **Account has registered VPC endpoints?** If the **account** has ≥1 registered VPC (PrivateLink)
+     endpoint — front-end or back-end, any use case — it **aborts** too, even if *this* workspace
+     isn't attached to one. CBI private access isn't GA yet and defaults to allow-all endpoints, so
+     any PrivateLink account is blocked for now (this limitation lifts once CBI private access GAs).
    - **Existing *restrictive* CBI ingress policy?** Only matters when the run will **assign** the new
      policy, and only for a policy that **actually restricts traffic** — an allow-all policy such as
      the account's baseline `default-policy` is ignored. When assigning over a restrictive one: an

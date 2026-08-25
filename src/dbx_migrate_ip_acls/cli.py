@@ -304,11 +304,14 @@ def _resolve_policy_name(cfg, conn: Connection, wc, yes: bool) -> None:
 def _acl_preflight(account, workspace_id, will_assign: bool, yes: bool, is_azure: bool = False) -> None:
     """Account-level pre-checks (run before any migration).
 
-    * A PAS (PrivateLink) attached -> always abort (unsupported for now; the produced policy would
-      be incomplete).
-    * Registered VPC (PrivateLink) endpoints for this workspace -> abort.
-      Both PrivateLink checks are skipped on Azure, which has neither a PAS nor VPC endpoints — an
-      Azure workspace only needs its IP access lists migrated.
+    * This workspace has a PAS (PrivateLink) attached -> always abort (unsupported for now; the
+      produced policy would be incomplete).
+    * The ACCOUNT has any registered VPC (PrivateLink) endpoints -> abort, even if this workspace
+      isn't attached to one (CBI private access defaults to allow-all endpoints, so migrating now
+      could change the effective access posture if PAS is later retired; blocked until CBI private
+      access is GA).
+      Both PrivateLink checks are skipped on Azure, which has neither a PAS nor account VPC
+      endpoints — an Azure workspace only needs its IP access lists migrated.
     * An existing assigned CBI ingress policy only matters when this run will **assign** the new
       policy (assigning would replace the existing one). When assigning:
         - enforced existing policy -> abort (migrating on top of it isn't supported yet);
@@ -347,20 +350,20 @@ def _acl_preflight(account, workspace_id, will_assign: bool, yes: bool, is_azure
                 "supported yet.",
             )
 
-        vpce = acl_core.workspace_vpc_endpoint_count(account, workspace_id)
-        if vpce:
+        endpoints = acl_core.account_registered_endpoint_count(account)
+        if endpoints:
             console.banner(
                 "danger",
-                f"This workspace has {vpce} registered VPC (PrivateLink) "
-                "endpoint(s). Migrating a PrivateLink workspace to CBI is NOT "
-                "supported yet - aborting.",
+                f"This account has {endpoints} registered VPC (PrivateLink) "
+                "endpoint(s). Migrating a workspace in a PrivateLink account to CBI "
+                "is NOT supported yet - aborting.",
             )
             raise typer.Exit(code=1)
-        if vpce is None:
+        if endpoints is None:
             console.banner(
                 "warn",
-                "Couldn't verify the workspace's registered VPC endpoints (account "
-                "read failed). If this workspace uses PrivateLink, migration is NOT "
+                "Couldn't verify the account's registered VPC endpoints (account "
+                "read failed). If this account uses PrivateLink, migration is NOT "
                 "supported yet.",
             )
 
