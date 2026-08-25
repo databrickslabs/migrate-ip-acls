@@ -301,12 +301,14 @@ def _resolve_policy_name(cfg, conn: Connection, wc, yes: bool) -> None:
     cfg.policy_name = entered or default
 
 
-def _acl_preflight(account, workspace_id, will_assign: bool, yes: bool) -> None:
+def _acl_preflight(account, workspace_id, will_assign: bool, yes: bool, is_azure: bool = False) -> None:
     """Account-level pre-checks (run before any migration).
 
     * A PAS (PrivateLink) attached -> always abort (unsupported for now; the produced policy would
       be incomplete).
     * Registered VPC (PrivateLink) endpoints for this workspace -> abort.
+      Both PrivateLink checks are skipped on Azure, which has neither a PAS nor VPC endpoints — an
+      Azure workspace only needs its IP access lists migrated.
     * An existing assigned CBI ingress policy only matters when this run will **assign** the new
       policy (assigning would replace the existing one). When assigning:
         - enforced existing policy -> abort (migrating on top of it isn't supported yet);
@@ -318,39 +320,49 @@ def _acl_preflight(account, workspace_id, will_assign: bool, yes: bool) -> None:
 
     from . import acl as acl_core
 
-    pas = acl_core.workspace_pas_attached(account, workspace_id)
-    if pas is True:
+    if is_azure:
+        # Azure has no Private Access Settings and no VPC (PrivateLink) endpoints, so neither
+        # PrivateLink pre-check applies — skip both and migrate the IP access lists only.
         console.banner(
-            "danger",
-            "This workspace has a Private Access Settings (PAS) object attached "
-            "(PrivateLink). Migrating a PAS/PrivateLink workspace to CBI is NOT "
-            "supported yet - aborting.",
+            "info",
+            "Azure workspace detected — Azure has no Private Access Settings or VPC-endpoint "
+            "(PrivateLink) concept, so those pre-checks are skipped; only the IP access lists are "
+            "migrated.",
         )
-        raise typer.Exit(code=1)
-    if pas is None:
-        console.banner(
-            "warn",
-            "Couldn't verify whether a PAS/PrivateLink is attached (account read "
-            "failed). If this workspace uses PrivateLink, migration is NOT "
-            "supported yet.",
-        )
+    else:
+        pas = acl_core.workspace_pas_attached(account, workspace_id)
+        if pas is True:
+            console.banner(
+                "danger",
+                "This workspace has a Private Access Settings (PAS) object attached "
+                "(PrivateLink). Migrating a PAS/PrivateLink workspace to CBI is NOT "
+                "supported yet - aborting.",
+            )
+            raise typer.Exit(code=1)
+        if pas is None:
+            console.banner(
+                "warn",
+                "Couldn't verify whether a PAS/PrivateLink is attached (account read "
+                "failed). If this workspace uses PrivateLink, migration is NOT "
+                "supported yet.",
+            )
 
-    vpce = acl_core.workspace_vpc_endpoint_count(account, workspace_id)
-    if vpce:
-        console.banner(
-            "danger",
-            f"This workspace has {vpce} registered VPC (PrivateLink) "
-            "endpoint(s). Migrating a PrivateLink workspace to CBI is NOT "
-            "supported yet - aborting.",
-        )
-        raise typer.Exit(code=1)
-    if vpce is None:
-        console.banner(
-            "warn",
-            "Couldn't verify the workspace's registered VPC endpoints (account "
-            "read failed). If this workspace uses PrivateLink, migration is NOT "
-            "supported yet.",
-        )
+        vpce = acl_core.workspace_vpc_endpoint_count(account, workspace_id)
+        if vpce:
+            console.banner(
+                "danger",
+                f"This workspace has {vpce} registered VPC (PrivateLink) "
+                "endpoint(s). Migrating a PrivateLink workspace to CBI is NOT "
+                "supported yet - aborting.",
+            )
+            raise typer.Exit(code=1)
+        if vpce is None:
+            console.banner(
+                "warn",
+                "Couldn't verify the workspace's registered VPC endpoints (account "
+                "read failed). If this workspace uses PrivateLink, migration is NOT "
+                "supported yet.",
+            )
 
     assigned_id, state = acl_core.assigned_ingress_state(account, workspace_id)
     if state is None:
@@ -799,8 +811,20 @@ def _run_acl(cfg: AclConfig, conn: Connection, yes: bool) -> None:
     ws_id = wc.get_workspace_id()
     _ensure_account_id(conn, "Migrating an IP ACL (checks PrivateLink + the existing assigned policy)")
     account = _account_client_or_exit(conn)
+    # Azure has no Private Access Settings / VPC-endpoint (PrivateLink) concept, so those pre-checks
+    # are skipped there. Derive the cloud from the account workspaces API (an authoritative field),
+    # not the host URL; an unreadable cloud defaults to non-Azure so the checks stay on (they never
+    # falsely abort on Azure anyway — it has no PAS and no back-end network config).
+    is_azure = acl_core.workspace_cloud(account, ws_id) == "azure"
     # An existing assigned policy is only replaced if we're going to assign the new one.
-    _acl_preflight(account, ws_id, will_assign=cfg.create_policy and cfg.auto_assign, yes=yes)
+    _acl_preflight(
+        account, ws_id, will_assign=cfg.create_policy and cfg.auto_assign, yes=yes, is_azure=is_azure
+    )
+
+    # Copy the egress of the policy the workspace currently runs under (its assigned policy, or the
+    # account default-policy when nothing is assigned) into the new policy, so its egress posture is
+    # preserved verbatim rather than reset to FULL_ACCESS. None → nothing readable → FULL_ACCESS.
+    egress_source, existing_egress = acl_core.assigned_egress(account, ws_id)
 
     # Read the workspace's IP access lists + enforcement state, and decide whether there's anything
     # to migrate at all (the quadrant gate may exit cleanly).
@@ -827,11 +851,19 @@ def _run_acl(cfg: AclConfig, conn: Connection, yes: bool) -> None:
     render.acl_current_config(analysis, workspace_enabled=True)
     _checkpoint(yes)
 
-    preview = acl_core.preview_block(analysis, cfg, note=lambda m: console.banner("info", m))
-    render.acl_preview(preview, cfg)
+    preview = acl_core.preview_block(
+        analysis, cfg, egress=existing_egress, note=lambda m: console.banner("info", m)
+    )
+    # Flag the egress as copied only when it actually restricts traffic — a FULL_ACCESS default (or
+    # an unreadable source) still gets the "egress left unrestricted" warning.
+    render.acl_preview(
+        preview, cfg, egress_source=(egress_source if acl_core.egress_restrictive(existing_egress) else None)
+    )
 
     if cfg.export:
-        _export_policy(cfg.export, acl_core.policy_payload(analysis, cfg, conn.account_id), yes)
+        _export_policy(
+            cfg.export, acl_core.policy_payload(analysis, cfg, conn.account_id, egress=existing_egress), yes
+        )
 
     # The responsibility warning sits directly before the write gate (or the propose-only exit), just
     # after the export log — the last thing shown before you decide to create/apply.
@@ -846,7 +878,12 @@ def _run_acl(cfg: AclConfig, conn: Connection, yes: bool) -> None:
 
     with console.status("Applying policy…"):
         result = acl_core.apply(
-            analysis, cfg, account, conn.account_id, note=lambda m: console.banner("info", m)
+            analysis,
+            cfg,
+            account,
+            conn.account_id,
+            note=lambda m: console.banner("info", m),
+            egress=existing_egress,
         )
     render.apply_results([result], conn.account_host, conn.account_id)
     _maybe_disable_ip_acls(cfg.disable_existing_ip_acls, [result], wc)

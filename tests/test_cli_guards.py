@@ -704,6 +704,34 @@ def test_acl_preflight_warns_but_proceeds_when_pas_unknown(monkeypatch, capsys):
     assert "couldn't verify" in capsys.readouterr().out.lower()
 
 
+def test_acl_preflight_skips_both_privatelink_checks_on_azure(monkeypatch, capsys):
+    # Azure has no PAS and no VPC endpoints — neither PrivateLink check should even be consulted, and
+    # a would-be-aborting endpoint count must NOT abort.
+    called = {"pas": 0, "vpce": 0}
+    monkeypatch.setattr(
+        "dbx_migrate_ip_acls.acl.workspace_pas_attached",
+        lambda a, w: called.__setitem__("pas", called["pas"] + 1) or True,
+    )
+    monkeypatch.setattr(
+        "dbx_migrate_ip_acls.acl.workspace_vpc_endpoint_count",
+        lambda a, w: called.__setitem__("vpce", called["vpce"] + 1) or 5,
+    )
+    monkeypatch.setattr("dbx_migrate_ip_acls.acl.assigned_ingress_state", lambda a, w: (None, None))
+    cli._acl_preflight(object(), 42, will_assign=True, yes=True, is_azure=True)  # must not raise
+    assert called == {"pas": 0, "vpce": 0}  # neither PrivateLink helper was called
+    assert "azure" in capsys.readouterr().out.lower()
+
+
+def test_acl_preflight_azure_still_runs_assigned_policy_check(monkeypatch):
+    # Skipping PrivateLink doesn't skip the existing-assigned-policy guard.
+    import typer
+
+    monkeypatch.setattr("dbx_migrate_ip_acls.acl.assigned_ingress_state", lambda a, w: ("p1", "enforced"))
+    with pytest.raises(typer.Exit) as e:
+        cli._acl_preflight(object(), 42, will_assign=True, yes=True, is_azure=True)
+    assert e.value.exit_code == 1
+
+
 def test_write_json_export_to_directory_uses_policy_id_filename(tmp_path):
     import json
     from pathlib import Path

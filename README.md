@@ -84,9 +84,9 @@ flowchart TD
     A(["dbx-migrate-ip-acls"]) --> B{"Confirm target workspace?"}
     B -->|no| X1["Abort — nothing written"]
     B -->|yes| ACCT["Account access (prompt account_id)<br/>run pre-checks before reading the IP ACLs"]
-    ACCT --> PAS{"PrivateLink? (PAS attached<br/>or workspace VPC endpoints > 0)"}
+    ACCT --> PAS{"PrivateLink? (non-Azure only:<br/>PAS attached or VPC endpoints > 0)"}
     PAS -->|yes| X2["ABORT — not supported yet"]
-    PAS -->|no| AS0{"Will create AND assign?"}
+    PAS -->|"no / Azure (checks skipped)"| AS0{"Will create AND assign?"}
     AS0 -->|"yes: existing ENFORCED CBI policy"| X3["ABORT"]
     AS0 -->|"yes: existing DRY-RUN CBI policy"| PROM["Warn; offer to promote to enforced, then stop"]
     AS0 -->|"yes: none / allow-all"| GATE{"enableIpAccessLists × rule count<br/>(read IP access lists)"}
@@ -105,8 +105,8 @@ flowchart TD
     EXPW --> CR
     CR -->|"no (--no-create-policy)"| X5["Propose-only — nothing written"]
     CR -->|yes| WMODE{"--policy-mode"}
-    WMODE -->|enforce| WE["Create ingress (blocking)<br/>+ FULL_ACCESS egress"]
-    WMODE -->|dry_run| WD["Create ingress_dry_run (log-only)<br/>+ FULL_ACCESS egress"]
+    WMODE -->|enforce| WE["Create ingress (blocking)<br/>+ egress copied from current policy"]
+    WMODE -->|dry_run| WD["Create ingress_dry_run (log-only)<br/>+ egress copied from current policy"]
     WE --> AS{"--auto-assign? (default on)"}
     WD --> AS
     AS -->|no| DONE(["Done"])
@@ -130,8 +130,10 @@ flowchart TD
 1. **Right after the workspace is chosen** — and *before* the IP access lists are read or shown —
    runs account-level **pre-checks**, so an unsupported or already-migrated workspace fails fast. It
    prompts for the `account_id` if it wasn't passed, then aborts on **PrivateLink** (a PAS object
-   attached, or ≥1 registered VPC endpoint for this workspace — not supported yet); and, only when
-   the run will **assign** the new policy, guards an existing **restrictive** CBI ingress policy
+   attached, or ≥1 registered VPC endpoint for this workspace — not supported yet; **both PrivateLink
+   checks are skipped on Azure**, which has neither concept, so an Azure workspace only migrates its
+   IP ACLs); and, only when the run will **assign** the new policy, guards an existing **restrictive**
+   CBI ingress policy
    already bound to the workspace (enforced → abort; dry-run → offer to promote it to enforced, then
    stop). An allow-all policy such as the account's baseline `default-policy` is ignored.
 2. Then decides whether there's anything to migrate, from the workspace-wide `enableIpAccessLists`
@@ -157,9 +159,13 @@ flowchart TD
    turns off the workspace's IP access list enforcement (`enableIpAccessLists=false`) so the old ACL
    and the new CBI policy don't both apply. The lists themselves are preserved (reversible).
 
-> This tool deliberately does **not** enrich, auto-allow Databricks' own control-plane IPs, or touch
-> egress: the created policy carries a permissive `FULL_ACCESS` egress. It assumes the existing ACL
-> is what you want.
+> This tool deliberately does **not** enrich or auto-allow Databricks' own control-plane IPs — it
+> assumes the existing ACL is what you want. It recreates the **ingress** (the IP ACLs) and, for
+> **egress**, copies the egress of the policy the workspace currently runs under **verbatim** — its
+> enforcement mode, allowed internet (FQDN) + storage destinations, and blocked-internet lists — so
+> egress posture is preserved rather than reset. The source is the workspace's assigned policy, or the
+> account baseline `default-policy` when nothing is assigned; only when neither is readable does it
+> fall back to a permissive `FULL_ACCESS` egress. This is automatic — there is no egress flag.
 
 ## ⚙️ Options
 

@@ -45,10 +45,12 @@ options go straight after the program name.
    the ACL has **only BLOCK lists**, a catch-all allow (all public IPs) is added, because CBI
    RESTRICTED_ACCESS is default-deny — without it a deny-only policy would block everything, flipping
    the ACL's default-allow-except-blocked meaning.
-3. Runs account-level **pre-checks** before migrating:
+3. Runs account-level **pre-checks** before migrating. The two PrivateLink checks below are **skipped
+   entirely on Azure** (detected from the `cloud` field the account workspaces API reports, not the
+   host URL) — an Azure workspace has neither a Private Access Settings object nor VPC endpoints, so
+   it only needs its IP ACLs migrated:
    - **PAS attached?** If the workspace has a Private Access Settings object (AWS/GCP front-end
-     PrivateLink), migration to CBI isn't supported yet — it **aborts**. (Azure workspaces have no
-     PAS, so this never trips there.)
+     PrivateLink), migration to CBI isn't supported yet — it **aborts**.
    - **Registered VPC endpoints?** If **this workspace** has ≥1 registered VPC (PrivateLink) endpoint
      — via its network config's back-end endpoints — it **aborts** too. (Account-wide endpoints
      belonging to *other* workspaces don't count.)
@@ -70,9 +72,13 @@ options go straight after the program name.
    workspace with no ingress control.
 
 > This tool deliberately does **not** auto-allow Databricks' own control-plane IPs or do any
-> enrichment — it assumes the existing ACL is what the customer wants. It also **only** migrates the
-> IP ACLs (ingress): the created policy carries a permissive `FULL_ACCESS` egress (serverless egress
-> is left unrestricted) — there is no egress option.
+> enrichment — it assumes the existing ACL is what the customer wants. It migrates the **ingress**
+> (the IP ACLs) and, for **egress**, copies the egress block of the policy the workspace currently
+> runs under **verbatim** — its enforcement mode, allowed internet (FQDN) + storage destinations, and
+> blocked-internet lists — so egress posture is preserved rather than reset. The source is the
+> workspace's assigned policy, or the account baseline `default-policy` when nothing is assigned; only
+> when neither is readable does it fall back to a permissive `FULL_ACCESS` egress. There is no egress
+> option — it always mirrors the current policy.
 
 ## Options
 
