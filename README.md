@@ -44,8 +44,9 @@ account-level (see *Account access* below).
 
 At a high level: the CLI reads the workspace's IP access lists through a **workspace client**, and
 does every check + write through an **account-admin client** against the Databricks **account** APIs.
-The engine turns the ACL into a CBI policy dataclass, which is previewed, optionally exported
-(JSON + Terraform), and — once you confirm — created and bound to the workspace.
+The engine turns the ACL into a CBI policy dataclass — carrying over the workspace's current egress
+verbatim — which is previewed, optionally exported (JSON + Terraform), and — once you confirm —
+created and bound to the workspace.
 
 ```mermaid
 flowchart LR
@@ -183,9 +184,10 @@ flowchart TD
 | `--account-host`, `--account-profile` | Account API host / a dedicated profile for account-level calls. |
 | `--yes`, `-y` | Non-interactive: skip the step-through pauses and the review/write gate. `--yes` **will** create + assign. |
 
-**Invalid flag combinations** (rejected up front): `--no-create-policy` with `--auto-assign`
-(nothing to bind); `--disable-existing-ip-acls` without both create + assign, or with `--policy-mode
-dry_run` (both would leave the workspace with no enforced ingress control).
+**Invalid flag combinations** (rejected up front — before the profile prompt or any account call, so
+they fail instantly): `--no-create-policy` with `--auto-assign` (nothing to bind);
+`--disable-existing-ip-acls` without both create + assign, or with `--policy-mode dry_run` (both
+would leave the workspace with no enforced ingress control).
 
 ## 🔒 Account access
 
