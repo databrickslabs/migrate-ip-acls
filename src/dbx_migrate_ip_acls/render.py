@@ -80,7 +80,7 @@ def acl_disabled_notice(analysis) -> None:
     )
 
 
-def acl_preview(preview: dict, cfg: AclConfig) -> None:
+def acl_preview(preview: dict, cfg: AclConfig, egress_source: str | None = None) -> None:
     console.rule("Proposed policy — JSON preview")
     console.banner(
         "warn", "Please review the proposed context-based ingress policy carefully before applying."
@@ -88,12 +88,22 @@ def acl_preview(preview: dict, cfg: AclConfig) -> None:
     console.json_panel(f"`{cfg.policy_mode_target}` block", preview.get(cfg.policy_mode_target))
     if "egress" in preview:
         console.json_panel("`egress` block", preview["egress"])
-        console.banner(
-            "warn",
-            "Serverless egress is left UNRESTRICTED (FULL_ACCESS) — this migration recreates ingress "
-            "rules only. Please consider your egress requirements before auto-assigning this policy "
-            "to a workspace.",
-        )
+        if egress_source:
+            # A restrictive egress was carried over from the workspace's current policy — say so
+            # rather than warning about an unrestricted default.
+            console.banner(
+                "info",
+                f"Egress copied verbatim from the policy the workspace currently runs under "
+                f"('{egress_source}') — its enforcement mode, allowed internet (FQDN) + storage "
+                "destinations and blocked-internet lists are preserved in the new policy.",
+            )
+        else:
+            console.banner(
+                "warn",
+                "Serverless egress is left UNRESTRICTED (FULL_ACCESS) — this migration recreates "
+                "ingress rules only. Please consider your egress requirements before auto-assigning "
+                "this policy to a workspace.",
+            )
 
 
 # ------------------------------------------------------------------------------- apply results

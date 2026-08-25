@@ -71,6 +71,19 @@ def test_acl_preview_shows_egress_block_and_full_access_warning(capsys):
     assert "unrestricted" in out and "egress" in out  # the FULL_ACCESS warning is present
 
 
+def test_acl_preview_reports_egress_copied_from_existing_policy(capsys):
+    from dbx_migrate_ip_acls.config import AclConfig
+
+    preview = {
+        "ingress": {"public_access": {"restriction_mode": "RESTRICTED_ACCESS"}},
+        "egress": {"network_access": {"restriction_mode": "RESTRICTED_ACCESS"}},
+    }
+    render.acl_preview(preview, AclConfig(policy_mode="enforce"), egress_source="default-policy")
+    out = capsys.readouterr().out.lower()
+    assert "copied" in out and "default-policy" in out  # names the source policy
+    assert "unrestricted" not in out  # the FULL_ACCESS warning is suppressed when egress is copied
+
+
 def test_acl_decisions_renders(capsys):
     from dbx_migrate_ip_acls.config import AclConfig
 

@@ -191,6 +191,26 @@ def _pas_account(pas_id):
     return type("Acct", (), {"workspaces": _WS()})()
 
 
+def _cloud_account(cloud, raise_=False):
+    class _WS:
+        def get(self, workspace_id):
+            if raise_:
+                raise RuntimeError("no perms")
+            return type("W", (), {"cloud": cloud})()
+
+    return type("Acct", (), {"workspaces": _WS()})()
+
+
+def test_workspace_cloud_reads_api_field():
+    # authoritative API field (not host-parsed), normalised to lower-case
+    assert acl_core.workspace_cloud(_cloud_account("azure"), 42) == "azure"
+    assert acl_core.workspace_cloud(_cloud_account("AWS"), 42) == "aws"
+    assert acl_core.workspace_cloud(_cloud_account("gcp"), 42) == "gcp"
+    # missing / unreadable -> None (caller defaults to non-Azure, so the PrivateLink checks stay on)
+    assert acl_core.workspace_cloud(_cloud_account(None), 42) is None
+    assert acl_core.workspace_cloud(_cloud_account("azure", raise_=True), 42) is None
+
+
 def test_workspace_pas_attached_true_false():
     assert acl_core.workspace_pas_attached(_pas_account("pas-abc"), 42) is True
     assert acl_core.workspace_pas_attached(_pas_account(None), 42) is False
@@ -376,8 +396,8 @@ def test_promote_dry_run_to_enforced_moves_block():
 
 
 def test_acl_policy_payload_is_curl_ready():
-    # --export builds the full AccountNetworkPolicy (ingress mode block + a FULL_ACCESS egress) as a
-    # dict. The migration only recreates IP ACLs (ingress); egress is left unrestricted.
+    # --export builds the full AccountNetworkPolicy (ingress mode block + a FULL_ACCESS egress by
+    # default, when no egress is carried over) as a dict.
     ws = _FakeWs([_FakeAcl("office", "ALLOW", True, ["8.8.8.8/32"])], ws_id=42)
     cfg = AclConfig(policy_mode="enforce", policy_name="my-acl")
     a = acl_core.analyze(cfg, ws)
@@ -386,6 +406,90 @@ def test_acl_policy_payload_is_curl_ready():
     assert payload["account_id"] == "acc-123"
     assert "ingress" in payload  # enforce -> ingress (not ingress_dry_run)
     assert payload["egress"]["network_access"]["restriction_mode"] == "FULL_ACCESS"
+
+
+# --- egress carry-over (copy the assigned policy's egress into the new policy) -----------------
+
+
+def _restricted_egress():
+    """A real (SDK) RESTRICTED_ACCESS egress block, so .as_dict() round-trips like the API's."""
+    from databricks.sdk.service.settings import (  # noqa: I001
+        EgressNetworkPolicyNetworkAccessPolicy as EA,
+        EgressNetworkPolicyNetworkAccessPolicyRestrictionMode as RM,
+        NetworkPolicyEgress,
+    )
+
+    return NetworkPolicyEgress(network_access=EA(restriction_mode=RM.RESTRICTED_ACCESS))
+
+
+def _egr_policy(egress):
+    return type("P", (), {"ingress": None, "ingress_dry_run": None, "egress": egress})()
+
+
+def test_assigned_egress_copies_the_assigned_policys_egress():
+    egr = _restricted_egress()
+    src, out = acl_core.assigned_egress(_policy_account("custom-policy", _egr_policy(egr)), 42)
+    assert src == "custom-policy"
+    assert out is not None and out is not egr  # deep-copied (independent object)
+    assert out.network_access.restriction_mode.value == "RESTRICTED_ACCESS"
+
+
+def test_assigned_egress_falls_back_to_default_policy_when_unassigned():
+    # Nothing explicitly assigned -> the account default-policy governs the workspace; copy ITS egress.
+    egr = _restricted_egress()
+
+    class _WNC:
+        def get_workspace_network_option_rpc(self, workspace_id):
+            return type("O", (), {"network_policy_id": None})()
+
+    class _NP:
+        def get_network_policy_rpc(self, network_policy_id):
+            assert network_policy_id == "default-policy"
+            return _egr_policy(egr)
+
+    acct = type("Acct", (), {"workspace_network_configuration": _WNC(), "network_policies": _NP()})()
+    src, out = acl_core.assigned_egress(acct, 42)
+    assert src == "default-policy"
+    assert out.network_access.restriction_mode.value == "RESTRICTED_ACCESS"
+
+
+def test_assigned_egress_none_when_default_policy_unreadable():
+    from databricks.sdk.errors import NotFound
+
+    class _WNC:
+        def get_workspace_network_option_rpc(self, workspace_id):
+            return type("O", (), {"network_policy_id": None})()
+
+    class _NP:
+        def get_network_policy_rpc(self, network_policy_id):
+            raise NotFound("no default-policy")
+
+    acct = type("Acct", (), {"workspace_network_configuration": _WNC(), "network_policies": _NP()})()
+    assert acl_core.assigned_egress(acct, 42) == (None, None)
+
+
+def test_preview_and_payload_carry_supplied_egress():
+    ws = _FakeWs([_FakeAcl("office", "ALLOW", True, ["8.8.8.8/32"])], ws_id=42)
+    cfg = AclConfig(policy_mode="enforce", policy_name="my-acl")
+    a = acl_core.analyze(cfg, ws)
+    prev = acl_core.preview_block(a, cfg, egress=_restricted_egress())
+    assert prev["egress"]["network_access"]["restriction_mode"] == "RESTRICTED_ACCESS"
+    payload = acl_core.policy_payload(a, cfg, account_id="acc", egress=_restricted_egress())
+    assert payload["egress"]["network_access"]["restriction_mode"] == "RESTRICTED_ACCESS"
+
+
+def test_apply_sends_the_supplied_egress():
+    captured = {}
+    ws = _FakeWs([_FakeAcl("office", "ALLOW", True, ["8.8.8.8/32"])], ws_id=42)
+    cfg = AclConfig(policy_name="p", create_policy=True, auto_assign=False)
+    acl_core.apply(
+        acl_core.analyze(cfg, ws),
+        cfg,
+        _CreateCapturingAccount(captured),
+        account_id="a",
+        egress=_restricted_egress(),
+    )
+    assert captured["policy"].egress.network_access.restriction_mode.value == "RESTRICTED_ACCESS"
 
 
 # --- enable_disabled_lists (re-enable individually-disabled lists) -----------------------------

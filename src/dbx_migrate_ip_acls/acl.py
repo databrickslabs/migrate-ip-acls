@@ -7,6 +7,7 @@ catch-all allow required when only BLOCK lists exist (CBI is default-deny).
 
 from __future__ import annotations
 
+import copy
 import ipaddress
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -15,6 +16,11 @@ from . import policy
 from .config import AclConfig
 
 Note = Callable[[str], None]
+
+# The account's baseline network policy. It governs any workspace that has no policy explicitly
+# assigned, so its egress is what such a workspace effectively runs under; we replicate that egress
+# (like any assigned policy's) so a workspace on an egress-restricted default keeps its posture.
+DEFAULT_POLICY_ID = "default-policy"
 
 
 @dataclass
@@ -84,6 +90,19 @@ def analyze(cfg: AclConfig, workspace_client) -> AclAnalysis:
         deny_specs=deny_specs,
         disabled_acls=disabled_acls,
     )
+
+
+def workspace_cloud(account, workspace_id) -> str | None:
+    """This workspace's cloud — 'aws', 'azure', or 'gcp' — read from the account workspaces API and
+    lower-cased. This is an authoritative API field (not parsed from the workspace host URL, which
+    could change), used to skip the PrivateLink pre-checks on Azure. None if it couldn't be
+    determined; best-effort so a read failure degrades to a warning/default rather than a crash."""
+    try:
+        ws = account.workspaces.get(workspace_id=int(workspace_id))
+        cloud = (getattr(ws, "cloud", None) or "").strip().lower()
+        return cloud or None
+    except Exception:  # noqa: BLE001 - couldn't determine; caller defaults to non-Azure (checks stay on)
+        return None
 
 
 def workspace_pas_attached(account, workspace_id) -> bool | None:
@@ -221,6 +240,28 @@ def assigned_ingress_state(account, workspace_id) -> tuple[str | None, str | Non
     return policy_id, None
 
 
+def assigned_egress(account, workspace_id) -> tuple[str | None, object | None]:
+    """The egress block to carry over verbatim to the new policy, so the migration preserves the
+    workspace's current egress posture exactly — its enforcement mode, allowed internet (FQDN) and
+    storage destinations, and blocked-internet lists. It's the egress of the policy currently
+    assigned to the workspace or, when nothing is explicitly assigned, the account baseline
+    `default-policy` that governs it by default (both cases replicated identically). Returns
+    (source_policy_id, egress); (None, None) when neither is readable, so the caller falls back to a
+    permissive FULL_ACCESS egress. Best-effort, and a deep copy independent of the fetched object."""
+    policy_id, pol = assigned_policy(account, workspace_id)
+    if policy_id:
+        # A policy is explicitly assigned (possibly `default-policy` itself). If the policy read
+        # failed (pol is None) we can't know its egress — return None so the caller uses FULL_ACCESS
+        # rather than guessing.
+        return policy_id, copy.deepcopy(getattr(pol, "egress", None))
+    # Nothing explicitly assigned → the account default-policy is in effect; replicate its egress.
+    try:
+        default = account.network_policies.get_network_policy_rpc(network_policy_id=DEFAULT_POLICY_ID)
+    except Exception:  # noqa: BLE001 - NotFound / read failure → caller uses FULL_ACCESS
+        return None, None
+    return DEFAULT_POLICY_ID, copy.deepcopy(getattr(default, "egress", None))
+
+
 def promote_dry_run_to_enforced(account, policy_id: str, note: Note = lambda _m: None) -> None:
     """Move a policy's dry-run ingress block into the enforced ingress slot (clearing dry-run)."""
     pol = account.network_policies.get_network_policy_rpc(network_policy_id=policy_id)
@@ -304,46 +345,61 @@ def build_block(analysis: AclAnalysis, cfg: AclConfig, note: Note = lambda _m: N
 
 
 def build_account_policy(
-    analysis: AclAnalysis, cfg: AclConfig, account_id: str, policy_id: str, note: Note = lambda _m: None
+    analysis: AclAnalysis,
+    cfg: AclConfig,
+    account_id: str,
+    policy_id: str,
+    note: Note = lambda _m: None,
+    egress=None,
 ):
     """The full AccountNetworkPolicy this migration would create. The migration only recreates the
-    IP ACLs (ingress); the API requires an egress block on create, so it carries a permissive
-    FULL_ACCESS egress (serverless egress is left unrestricted). Used to create + to export."""
+    IP ACLs (ingress); the API requires an egress block on create, so it carries over the egress of
+    the workspace's currently-assigned policy verbatim (`egress`), preserving its egress posture. When
+    that isn't known (`egress` is None — nothing assigned / unreadable) it falls back to a permissive
+    FULL_ACCESS egress. Used to create + to export."""
     from databricks.sdk.service.settings import AccountNetworkPolicy
 
     np = AccountNetworkPolicy(
-        account_id=account_id, network_policy_id=policy_id, egress=policy.build_full_access_egress()
+        account_id=account_id,
+        network_policy_id=policy_id,
+        egress=egress if egress is not None else policy.build_full_access_egress(),
     )
     setattr(np, cfg.policy_mode_target, build_block(analysis, cfg, note))
     return np
 
 
-def policy_payload(analysis: AclAnalysis, cfg: AclConfig, account_id: str) -> dict:
+def policy_payload(analysis: AclAnalysis, cfg: AclConfig, account_id: str, egress=None) -> dict:
     """The proposed network policy as a plain dict (for --export / a curl body)."""
     policy_id = resolve_policy_id(cfg, analysis.workspace_id)
-    return build_account_policy(analysis, cfg, account_id, policy_id).as_dict()
+    return build_account_policy(analysis, cfg, account_id, policy_id, egress=egress).as_dict()
 
 
-def preview_block(analysis: AclAnalysis, cfg: AclConfig, note: Note = lambda _m: None) -> dict:
-    # Mirror the policy body that would be created: the ingress mode block + the permissive
-    # FULL_ACCESS egress the migration carries (serverless egress is left unrestricted), so the
-    # preview surfaces the egress default too.
+def preview_block(analysis: AclAnalysis, cfg: AclConfig, egress=None, note: Note = lambda _m: None) -> dict:
+    # Mirror the policy body that would be created: the ingress mode block + the egress carried over
+    # from the workspace's currently-assigned policy (`egress`), falling back to the permissive
+    # FULL_ACCESS default when that isn't known, so the preview surfaces the real egress too.
     block = build_block(analysis, cfg, note)
+    egress = egress if egress is not None else policy.build_full_access_egress()
     return {
         cfg.policy_mode_target: block.as_dict(),
-        "egress": policy.build_full_access_egress().as_dict(),
+        "egress": egress.as_dict(),
     }
 
 
 def apply(
-    analysis: AclAnalysis, cfg: AclConfig, account, account_id: str, note: Note = lambda _m: None
+    analysis: AclAnalysis,
+    cfg: AclConfig,
+    account,
+    account_id: str,
+    note: Note = lambda _m: None,
+    egress=None,
 ) -> dict:
     """Create the named policy (migrate-acl only creates new policies — name uniqueness is checked
     up front) and optionally assign this workspace."""
     from databricks.sdk.service.settings import WorkspaceNetworkOption
 
     policy_id = resolve_policy_id(cfg, analysis.workspace_id)
-    new_policy = build_account_policy(analysis, cfg, account_id, policy_id, note)
+    new_policy = build_account_policy(analysis, cfg, account_id, policy_id, note, egress=egress)
     result = account.network_policies.create_network_policy_rpc(network_policy=new_policy)
     effective_id = result.network_policy_id or policy_id
 
