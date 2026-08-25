@@ -250,37 +250,22 @@ def test_workspace_pas_attached_none_on_error():
     assert acl_core.workspace_pas_attached(acct, 42) is None
 
 
-def _vpce_account(network_id, dataplane=None, rest_api=None):
-    ve = type("VE", (), {"dataplane_relay": dataplane, "rest_api": rest_api})()
+def _endpoint_account(endpoints, raise_=False):
+    class _VE:
+        def list(self):
+            if raise_:
+                raise RuntimeError("no perms")
+            return list(endpoints)
 
-    class _WS:
-        def get(self, workspace_id):
-            return type("W", (), {"network_id": network_id})()
-
-    class _NW:
-        def get(self, network_id):
-            return type("N", (), {"vpc_endpoints": ve})()
-
-    return type("Acct", (), {"workspaces": _WS(), "networks": _NW()})()
+    return type("Acct", (), {"vpc_endpoints": _VE()})()
 
 
-def test_workspace_vpc_endpoint_count():
-    # no network config -> 0 (no VPC endpoints for this workspace)
-    assert acl_core.workspace_vpc_endpoint_count(_vpce_account(None), 42) == 0
-    # back-end endpoints (dataplane_relay + rest_api) are counted
-    acct = _vpce_account("net-1", dataplane=["vpce-a"], rest_api=["vpce-b", "vpce-c"])
-    assert acl_core.workspace_vpc_endpoint_count(acct, 42) == 3
-    # empty lists -> 0
-    assert acl_core.workspace_vpc_endpoint_count(_vpce_account("net-1"), 42) == 0
-
-
-def test_workspace_vpc_endpoint_count_none_on_error():
-    class _WS:
-        def get(self, workspace_id):
-            raise RuntimeError("no perms")
-
-    acct = type("Acct", (), {"workspaces": _WS()})()
-    assert acl_core.workspace_vpc_endpoint_count(acct, 42) is None
+def test_account_registered_endpoint_count():
+    # any account-registered VPC endpoint counts, regardless of use case or workspace attachment
+    assert acl_core.account_registered_endpoint_count(_endpoint_account([])) == 0
+    assert acl_core.account_registered_endpoint_count(_endpoint_account(["fe", "be"])) == 2
+    # unreadable (account read failed) -> None (caller warns and proceeds)
+    assert acl_core.account_registered_endpoint_count(_endpoint_account([], raise_=True)) is None
 
 
 def test_policy_exists_true_false():

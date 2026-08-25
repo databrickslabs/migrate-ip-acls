@@ -135,20 +135,16 @@ def workspace_pas_attached(account, workspace_id) -> bool | None:
         return None
 
 
-def workspace_vpc_endpoint_count(account, workspace_id) -> int | None:
-    """How many VPC (PrivateLink) endpoints are registered for THIS workspace — via its network
-    config's back-end endpoints (dataplane_relay + rest_api). Account-wide endpoints for *other*
-    workspaces don't count. 0 if none / no network config; None if it couldn't be determined."""
+def account_registered_endpoint_count(account) -> int | None:
+    """How many VPC (PrivateLink) endpoints are registered in the ACCOUNT — any use case: front-end
+    (GENERAL_ACCESS / WORKSPACE_ACCESS) or back-end SCC relay (DATAPLANE_RELAY_ACCESS). Any registered
+    endpoint means the account uses PrivateLink, so migration is blocked until CBI private access is
+    GA — even if THIS workspace isn't attached to one (CBI private access defaults to allow-all
+    endpoints, so migrating now could change the effective access posture if PAS is later retired).
+    0 if none; None if it couldn't be determined. Best-effort so a read failure degrades to a
+    warning rather than a crash."""
     try:
-        ws = account.workspaces.get(workspace_id=int(workspace_id))
-        network_id = getattr(ws, "network_id", None)
-        if not network_id:
-            return 0
-        net = account.networks.get(network_id=network_id)
-        ve = getattr(net, "vpc_endpoints", None)
-        if ve is None:
-            return 0
-        return len(getattr(ve, "dataplane_relay", None) or []) + len(getattr(ve, "rest_api", None) or [])
+        return len(list(account.vpc_endpoints.list()))
     except Exception:  # noqa: BLE001 - couldn't determine; caller warns
         return None
 

@@ -84,7 +84,7 @@ flowchart TD
     A(["dbx-migrate-ip-acls"]) --> B{"Confirm target workspace?"}
     B -->|no| X1["Abort — nothing written"]
     B -->|yes| ACCT["Account access (prompt account_id)<br/>run pre-checks before reading the IP ACLs"]
-    ACCT --> PAS{"PrivateLink? (non-Azure only:<br/>PAS attached or VPC endpoints > 0)"}
+    ACCT --> PAS{"PrivateLink? (non-Azure only: workspace PAS<br/>attached or account VPC endpoints > 0)"}
     PAS -->|yes| X2["ABORT — not supported yet"]
     PAS -->|"no / Azure (checks skipped)"| AS0{"Will create AND assign?"}
     AS0 -->|"yes: existing ENFORCED CBI policy"| X3["ABORT"]
@@ -129,11 +129,12 @@ flowchart TD
 
 1. **Right after the workspace is chosen** — and *before* the IP access lists are read or shown —
    runs account-level **pre-checks**, so an unsupported or already-migrated workspace fails fast. It
-   prompts for the `account_id` if it wasn't passed, then aborts on **PrivateLink** (a PAS object
-   attached, or ≥1 registered VPC endpoint for this workspace — not supported yet; **both PrivateLink
-   checks are skipped on Azure**, which has neither concept, so an Azure workspace only migrates its
-   IP ACLs); and, only when the run will **assign** the new policy, guards an existing **restrictive**
-   CBI ingress policy
+   prompts for the `account_id` if it wasn't passed, then aborts on **PrivateLink** — this workspace
+   has a PAS attached, or the **account** has ≥1 registered VPC endpoint (any workspace; CBI private
+   access isn't GA yet, so any PrivateLink account is blocked for now) — not supported yet; **both
+   PrivateLink checks are skipped on Azure**, which has neither concept, so an Azure workspace only
+   migrates its IP ACLs; and, only when the run will **assign** the new policy, guards an existing
+   **restrictive** CBI ingress policy
    already bound to the workspace (enforced → abort; dry-run → offer to promote it to enforced, then
    stop). An allow-all policy such as the account's baseline `default-policy` is ignored.
 2. Then decides whether there's anything to migrate, from the workspace-wide `enableIpAccessLists`

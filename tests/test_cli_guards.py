@@ -636,21 +636,23 @@ def test_acl_preflight_aborts_on_pas(monkeypatch):
     assert e.value.exit_code == 1
 
 
-def test_acl_preflight_aborts_on_vpc_endpoints(monkeypatch):
+def test_acl_preflight_aborts_on_account_registered_endpoints(monkeypatch, capsys):
+    # ANY registered VPC endpoint in the account aborts (AWS), even though this workspace has no PAS.
     import typer
 
     monkeypatch.setattr("dbx_migrate_ip_acls.acl.workspace_pas_attached", lambda a, w: False)
-    monkeypatch.setattr("dbx_migrate_ip_acls.acl.workspace_vpc_endpoint_count", lambda a, w: 2)
+    monkeypatch.setattr("dbx_migrate_ip_acls.acl.account_registered_endpoint_count", lambda a: 2)
     with pytest.raises(typer.Exit) as e:
         cli._acl_preflight(object(), 42, will_assign=True, yes=True)
     assert e.value.exit_code == 1
+    assert "account has 2 registered" in capsys.readouterr().out.lower()
 
 
 def test_acl_preflight_aborts_on_existing_enforced_policy_when_assigning(monkeypatch):
     import typer
 
     monkeypatch.setattr("dbx_migrate_ip_acls.acl.workspace_pas_attached", lambda a, w: False)
-    monkeypatch.setattr("dbx_migrate_ip_acls.acl.workspace_vpc_endpoint_count", lambda a, w: 0)
+    monkeypatch.setattr("dbx_migrate_ip_acls.acl.account_registered_endpoint_count", lambda a: 0)
     monkeypatch.setattr("dbx_migrate_ip_acls.acl.assigned_ingress_state", lambda a, w: ("p1", "enforced"))
     with pytest.raises(typer.Exit) as e:
         cli._acl_preflight(object(), 42, will_assign=True, yes=True)
@@ -660,7 +662,7 @@ def test_acl_preflight_aborts_on_existing_enforced_policy_when_assigning(monkeyp
 def test_acl_preflight_enforced_warns_and_proceeds_when_not_assigning(monkeypatch, capsys):
     # not assigning -> existing enforced policy stays put; warn and continue (no abort).
     monkeypatch.setattr("dbx_migrate_ip_acls.acl.workspace_pas_attached", lambda a, w: False)
-    monkeypatch.setattr("dbx_migrate_ip_acls.acl.workspace_vpc_endpoint_count", lambda a, w: 0)
+    monkeypatch.setattr("dbx_migrate_ip_acls.acl.account_registered_endpoint_count", lambda a: 0)
     monkeypatch.setattr("dbx_migrate_ip_acls.acl.assigned_ingress_state", lambda a, w: ("p1", "enforced"))
     cli._acl_preflight(object(), 42, will_assign=False, yes=True)  # must not raise
     assert "isn't assigning" in capsys.readouterr().out
@@ -670,7 +672,7 @@ def test_acl_preflight_dry_run_cancels_without_promote_noninteractive(monkeypatc
     import typer
 
     monkeypatch.setattr("dbx_migrate_ip_acls.acl.workspace_pas_attached", lambda a, w: False)
-    monkeypatch.setattr("dbx_migrate_ip_acls.acl.workspace_vpc_endpoint_count", lambda a, w: 0)
+    monkeypatch.setattr("dbx_migrate_ip_acls.acl.account_registered_endpoint_count", lambda a: 0)
     monkeypatch.setattr("dbx_migrate_ip_acls.acl.assigned_ingress_state", lambda a, w: ("p1", "dry_run"))
     promoted = {"n": 0}
     monkeypatch.setattr(
@@ -686,7 +688,7 @@ def test_acl_preflight_dry_run_promotes_when_confirmed(monkeypatch):
     import typer
 
     monkeypatch.setattr("dbx_migrate_ip_acls.acl.workspace_pas_attached", lambda a, w: False)
-    monkeypatch.setattr("dbx_migrate_ip_acls.acl.workspace_vpc_endpoint_count", lambda a, w: 0)
+    monkeypatch.setattr("dbx_migrate_ip_acls.acl.account_registered_endpoint_count", lambda a: 0)
     monkeypatch.setattr("dbx_migrate_ip_acls.acl.assigned_ingress_state", lambda a, w: ("p1", "dry_run"))
     promoted = {"n": 0}
     monkeypatch.setattr(
@@ -702,34 +704,34 @@ def test_acl_preflight_dry_run_promotes_when_confirmed(monkeypatch):
 
 def test_acl_preflight_passes_when_clean(monkeypatch):
     monkeypatch.setattr("dbx_migrate_ip_acls.acl.workspace_pas_attached", lambda a, w: False)
-    monkeypatch.setattr("dbx_migrate_ip_acls.acl.workspace_vpc_endpoint_count", lambda a, w: 0)
+    monkeypatch.setattr("dbx_migrate_ip_acls.acl.account_registered_endpoint_count", lambda a: 0)
     monkeypatch.setattr("dbx_migrate_ip_acls.acl.assigned_ingress_state", lambda a, w: (None, None))
     cli._acl_preflight(object(), 42, will_assign=True, yes=True)  # must not raise
 
 
 def test_acl_preflight_warns_but_proceeds_when_pas_unknown(monkeypatch, capsys):
     monkeypatch.setattr("dbx_migrate_ip_acls.acl.workspace_pas_attached", lambda a, w: None)
-    monkeypatch.setattr("dbx_migrate_ip_acls.acl.workspace_vpc_endpoint_count", lambda a, w: 0)
+    monkeypatch.setattr("dbx_migrate_ip_acls.acl.account_registered_endpoint_count", lambda a: 0)
     monkeypatch.setattr("dbx_migrate_ip_acls.acl.assigned_ingress_state", lambda a, w: (None, None))
     cli._acl_preflight(object(), 42, will_assign=True, yes=True)  # must not raise
     assert "couldn't verify" in capsys.readouterr().out.lower()
 
 
 def test_acl_preflight_skips_both_privatelink_checks_on_azure(monkeypatch, capsys):
-    # Azure has no PAS and no VPC endpoints — neither PrivateLink check should even be consulted, and
-    # a would-be-aborting endpoint count must NOT abort.
-    called = {"pas": 0, "vpce": 0}
+    # Azure has no PAS and no account VPC endpoints — neither PrivateLink check should even be
+    # consulted, and a would-be-aborting endpoint count must NOT abort.
+    called = {"pas": 0, "endpoints": 0}
     monkeypatch.setattr(
         "dbx_migrate_ip_acls.acl.workspace_pas_attached",
         lambda a, w: called.__setitem__("pas", called["pas"] + 1) or True,
     )
     monkeypatch.setattr(
-        "dbx_migrate_ip_acls.acl.workspace_vpc_endpoint_count",
-        lambda a, w: called.__setitem__("vpce", called["vpce"] + 1) or 5,
+        "dbx_migrate_ip_acls.acl.account_registered_endpoint_count",
+        lambda a: called.__setitem__("endpoints", called["endpoints"] + 1) or 5,
     )
     monkeypatch.setattr("dbx_migrate_ip_acls.acl.assigned_ingress_state", lambda a, w: (None, None))
     cli._acl_preflight(object(), 42, will_assign=True, yes=True, is_azure=True)  # must not raise
-    assert called == {"pas": 0, "vpce": 0}  # neither PrivateLink helper was called
+    assert called == {"pas": 0, "endpoints": 0}  # neither PrivateLink helper was called
     assert "azure" in capsys.readouterr().out.lower()
 
 
