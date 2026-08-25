@@ -726,6 +726,14 @@ def migrate(
     ),
 ):
     """Migrate this workspace's IP access list to a new CBI network policy."""
+    # Reject invalid flag combinations FIRST — before the banner, the profile prompt, or any client
+    # setup — so a bad combo fails immediately instead of after the user has been asked to pick a
+    # profile (these depend only on the flags, not on any workspace/account state).
+    try:
+        validate_acl_apply(create_policy, auto_assign, disable_existing_ip_acls, policy_mode.value)
+    except ValueError as e:
+        raise typer.BadParameter(str(e)) from None
+
     from . import tls, usage
 
     tls.enable()
@@ -789,12 +797,9 @@ def _reconcile_disabled_lists(analysis, cfg: AclConfig, wc, yes: bool):
 
 
 def _run_acl(cfg: AclConfig, conn: Connection, yes: bool) -> None:
+    # Flag-combination validation happens up front in the `migrate` callback (before the profile
+    # prompt), so by the time we're here the combination is already known-good.
     from . import acl as acl_core
-
-    try:
-        validate_acl_apply(cfg.create_policy, cfg.auto_assign, cfg.disable_existing_ip_acls, cfg.policy_mode)
-    except ValueError as e:
-        raise typer.BadParameter(str(e)) from None
 
     console.title_panel(
         "IP Access List → CBI migration", "Migrate this workspace's IP ACL to a new CBI policy."

@@ -261,6 +261,17 @@ def test_dry_run_disable_is_rejected():
     assert "dry_run" in text or "dry-run" in text
 
 
+def test_invalid_flags_rejected_before_profile_prompt():
+    # Flag-combination errors depend only on the flags, so they must fire FIRST — before profile
+    # resolution. With no --profile given (which would otherwise prompt, or error asking for one),
+    # the flag-combination error is what surfaces, not a request to pick a profile.
+    result = runner.invoke(cli.app, ["--no-create-policy"])
+    assert result.exit_code == 2
+    text = _err_text(result)
+    assert "auto-assign" in text  # the flag-combination error
+    assert "profile" not in text.lower()  # we never reached profile resolution
+
+
 class _FakeWsClient:
     class _Cfg:
         host = "https://ws.cloud.databricks.com"
