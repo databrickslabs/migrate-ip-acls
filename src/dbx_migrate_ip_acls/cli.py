@@ -817,10 +817,13 @@ def _run_acl(cfg: AclConfig, conn: Connection, yes: bool) -> None:
     _ensure_account_id(conn, "Migrating an IP ACL (checks PrivateLink + the existing assigned policy)")
     account = _account_client_or_exit(conn)
     # Azure has no Private Access Settings / VPC-endpoint (PrivateLink) concept, so those pre-checks
-    # are skipped there. Derive the cloud from the account workspaces API (an authoritative field),
-    # not the host URL; an unreadable cloud defaults to non-Azure so the checks stay on (they never
-    # falsely abort on Azure anyway — it has no PAS and no back-end network config).
-    is_azure = acl_core.workspace_cloud(account, ws_id) == "azure"
+    # are skipped there. Resolve the cloud from the account workspaces API `cloud` field, falling back
+    # to the workspace host's domain when the API doesn't populate it (it frequently doesn't). An
+    # unknown cloud defaults to non-Azure so the checks stay on (they never falsely abort on Azure
+    # anyway — it has no PAS and no back-end network config).
+    ws_host = getattr(getattr(wc, "config", None), "host", None)
+    cloud = acl_core.workspace_cloud(account, ws_id, host=ws_host)
+    is_azure = cloud == "azure"
     # An existing assigned policy is only replaced if we're going to assign the new one.
     _acl_preflight(
         account, ws_id, will_assign=cfg.create_policy and cfg.auto_assign, yes=yes, is_azure=is_azure

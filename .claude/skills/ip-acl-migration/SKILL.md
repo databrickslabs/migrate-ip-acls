@@ -46,9 +46,9 @@ options go straight after the program name.
    RESTRICTED_ACCESS is default-deny — without it a deny-only policy would block everything, flipping
    the ACL's default-allow-except-blocked meaning.
 3. Runs account-level **pre-checks** before migrating. The two PrivateLink checks below are **skipped
-   entirely on Azure** (detected from the `cloud` field the account workspaces API reports, not the
-   host URL) — an Azure workspace has neither a Private Access Settings object nor VPC endpoints, so
-   it only needs its IP ACLs migrated:
+   entirely on Azure** (the cloud is resolved from the account workspaces API `cloud` field, falling
+   back to the workspace host's domain when the API doesn't populate it) — an Azure workspace has
+   neither a Private Access Settings object nor VPC endpoints, so it only needs its IP ACLs migrated:
    - **PAS attached?** If the workspace has a Private Access Settings object (AWS/GCP front-end
      PrivateLink), migration to CBI isn't supported yet — it **aborts**.
    - **Registered VPC endpoints?** If **this workspace** has ≥1 registered VPC (PrivateLink) endpoint
