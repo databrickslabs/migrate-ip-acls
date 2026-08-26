@@ -15,6 +15,7 @@ import typer
 
 from . import console, render
 from .config import (
+    DEFAULT_ACCOUNT_HOST,
     DEFAULT_NAME_PREFIX,
     MAX_POLICY_ID_LEN,
     AclConfig,
@@ -95,9 +96,30 @@ def _conn(profile, account_id, account_host, account_profile=None) -> Connection
     return Connection(
         profile=profile,
         account_id=account_id or "",
-        account_host=account_host,
+        # None → not pinned: the CLI derives it from the workspace host (see _resolve_account_host).
+        account_host=account_host or DEFAULT_ACCOUNT_HOST,
+        account_host_explicit=account_host is not None,
         account_profile=account_profile,
     )
+
+
+def _resolve_account_host(conn: Connection, wc) -> None:
+    """When --account-host wasn't pinned, derive it from the workspace host so a workspace in a
+    non-default environment (e.g. AWS staging) reaches the matching account API instead of the AWS
+    prod default. An explicit --account-host is always respected. Mutates conn."""
+    if conn.account_host_explicit:
+        return
+    from . import acl as acl_core
+
+    ws_host = getattr(getattr(wc, "config", None), "host", None)
+    derived = acl_core.account_host_from_workspace_host(ws_host)
+    if derived and derived != conn.account_host:
+        console.banner(
+            "info",
+            f"Using account host '{derived}', matched to the workspace's environment. "
+            "Pass --account-host to override.",
+        )
+        conn.account_host = derived
 
 
 def _ensure_account_id(conn: Connection, reason: str) -> None:
@@ -711,7 +733,11 @@ def migrate(
         "--export . for the current directory). Works in propose-only mode too.",
     ),
     account_id: str | None = typer.Option(None, help="Databricks account_id (apply/pre-checks)."),
-    account_host: str = typer.Option("https://accounts.cloud.databricks.com", help="Account host."),
+    account_host: str | None = typer.Option(
+        None,
+        help="Account API host. Default: derived from the workspace's environment (e.g. AWS staging, "
+        "GCP, Azure), falling back to the AWS prod account console.",
+    ),
     account_profile: str | None = typer.Option(
         None, help="Profile for account-level calls. Defaults to unified auth."
     ),
@@ -808,6 +834,10 @@ def _run_acl(cfg: AclConfig, conn: Connection, yes: bool) -> None:
         "IP Access List → CBI migration", "Migrate this workspace's IP ACL to a new CBI policy."
     )
     wc = _confirm_workspace(conn, yes)
+    # Point account-level calls at the account console matching the workspace's environment (unless
+    # --account-host was pinned), so a staging / GCP / Azure workspace doesn't fail against the AWS
+    # prod default.
+    _resolve_account_host(conn, wc)
 
     # Account access is always needed — the pre-checks (PAS / VPC endpoints / existing assigned
     # policy), the name-uniqueness check, and the apply itself are all account-level — and it's the

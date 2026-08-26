@@ -108,6 +108,28 @@ def cloud_from_host(host: str | None) -> str | None:
     return None
 
 
+def account_host_from_workspace_host(host: str | None) -> str | None:
+    """Derive the account-console API host from a workspace host, so a workspace in a non-default
+    environment (e.g. AWS staging) reaches the matching account API instead of the AWS prod default.
+    Azure uses its fixed account host; AWS (prod / staging / vanity) and GCP replace the workspace's
+    own first DNS label with 'accounts' — e.g. dbc-x.staging.cloud.databricks.com ->
+    accounts.staging.cloud.databricks.com. None if it can't be derived from the host."""
+    h = (host or "").strip().lower()
+    h = h.split("://", 1)[-1]  # drop any scheme
+    h = h.split("/", 1)[0]  # drop any path / trailing slash
+    if not h:
+        return None
+    if "azuredatabricks.net" in h:
+        return "https://accounts.azuredatabricks.net"
+    if "cloud.databricks.com" in h or "gcp.databricks.com" in h:
+        # The first label is workspace-specific (dbc-<id> or a vanity name); everything after it is
+        # the environment domain shared with the account console.
+        _first, _, rest = h.partition(".")
+        if rest:
+            return f"https://accounts.{rest}"
+    return None
+
+
 def workspace_cloud(account, workspace_id, host: str | None = None) -> str | None:
     """This workspace's cloud — 'aws', 'azure', or 'gcp'. Prefers the authoritative `cloud` field on
     the account workspaces API; when that's empty (it frequently is — e.g. AWS workspaces report no

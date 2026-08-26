@@ -181,7 +181,7 @@ flowchart TD
 | `--create-policy` / `--no-create-policy` | Master write switch. **On by default** (a review gate still confirms). For a propose-only run: `--no-create-policy --no-auto-assign`. |
 | `--disable-existing-ip-acls` | After create **and** assign, turn off the workspace's IP access lists. Requires create + assign **and** `--policy-mode enforce`. Off by default. |
 | `--account-id` (+ account-admin creds) | **Always required** — pre-checks and create/assign are account-level. |
-| `--account-host`, `--account-profile` | Account API host / a dedicated profile for account-level calls. |
+| `--account-host`, `--account-profile` | Account API host (when unset, **derived from the workspace's environment** — AWS staging / GCP / Azure — falling back to the AWS prod console) / a dedicated profile for account-level calls. |
 | `--yes`, `-y` | Non-interactive: skip the step-through pauses and the review/write gate. `--yes` **will** create + assign. |
 
 **Invalid flag combinations** (rejected up front — before the profile prompt or any account call, so
@@ -196,6 +196,12 @@ APIs, and create/assign write them. Pass `--account-id <numeric id>` with **acco
 credentials resolvable by unified auth for the account host (an account-admin service principal via
 OAuth M2M is the recommended path). A workspace-only OAuth session **cannot** call the account API —
 use `--account-profile` (or env) for account creds if your workspace profile can't.
+
+The **account host** is chosen to match the workspace's environment: unless you pass `--account-host`,
+it's derived from the workspace host (e.g. an AWS *staging* workspace →
+`accounts.staging.cloud.databricks.com`; GCP → `accounts.gcp.databricks.com`; Azure →
+`accounts.azuredatabricks.net`), falling back to the AWS prod console when it can't be determined. So
+a non-prod workspace no longer fails against the wrong account API.
 
 ## 📈 Usage tracking
 

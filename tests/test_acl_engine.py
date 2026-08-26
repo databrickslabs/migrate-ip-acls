@@ -211,6 +211,25 @@ def test_cloud_from_host_maps_all_three_clouds():
     assert acl_core.cloud_from_host("https://example.com") is None
 
 
+def test_account_host_from_workspace_host():
+    f = acl_core.account_host_from_workspace_host
+    # AWS prod / staging / vanity: replace the workspace's first label with 'accounts'
+    assert f("https://dbc-8d247fe0-6d2c.cloud.databricks.com") == "https://accounts.cloud.databricks.com"
+    assert (
+        f("https://dbc-8d247fe0-6d2c.staging.cloud.databricks.com/")
+        == "https://accounts.staging.cloud.databricks.com"
+    )
+    assert f("https://acme.cloud.databricks.com") == "https://accounts.cloud.databricks.com"
+    # GCP
+    assert f("https://1234.gcp.databricks.com") == "https://accounts.gcp.databricks.com"
+    # Azure uses its fixed account host (the region label must NOT leak into it)
+    assert f("https://adb-123.4.azuredatabricks.net") == "https://accounts.azuredatabricks.net"
+    # undecidable / empty -> None (caller keeps its default)
+    assert f("https://example.com") is None
+    assert f("") is None
+    assert f(None) is None
+
+
 def test_workspace_cloud_prefers_api_field():
     # the authoritative API field wins (normalised to lower-case), even if a host is also given
     assert acl_core.workspace_cloud(_cloud_account("azure"), 42) == "azure"
