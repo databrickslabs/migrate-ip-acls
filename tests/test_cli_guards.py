@@ -735,6 +735,42 @@ def test_acl_preflight_skips_both_privatelink_checks_on_azure(monkeypatch, capsy
     assert "azure" in capsys.readouterr().out.lower()
 
 
+def _wc_host(host):
+    return type("WC", (), {"config": type("Cfg", (), {"host": host})()})()
+
+
+def test_resolve_account_host_derives_from_workspace_when_not_pinned(capsys):
+    from dbx_migrate_ip_acls.config import Connection
+
+    # staging workspace, --account-host not pinned -> switch to the staging account console
+    conn = Connection(account_host_explicit=False)
+    cli._resolve_account_host(conn, _wc_host("https://dbc-x.staging.cloud.databricks.com"))
+    assert conn.account_host == "https://accounts.staging.cloud.databricks.com"
+    assert "accounts.staging.cloud.databricks.com" in capsys.readouterr().out
+
+
+def test_resolve_account_host_respects_explicit(capsys):
+    from dbx_migrate_ip_acls.config import Connection
+
+    conn = Connection(account_host="https://accounts.cloud.databricks.com", account_host_explicit=True)
+    cli._resolve_account_host(conn, _wc_host("https://dbc-x.staging.cloud.databricks.com"))
+    assert conn.account_host == "https://accounts.cloud.databricks.com"  # unchanged
+    assert capsys.readouterr().out == ""  # no announcement
+
+
+def test_resolve_account_host_noop_for_prod_or_unknown(capsys):
+    from dbx_migrate_ip_acls.config import Connection
+
+    # prod workspace -> derived host equals the default, so no change/announcement
+    conn = Connection(account_host_explicit=False)
+    cli._resolve_account_host(conn, _wc_host("https://dbc-x.cloud.databricks.com"))
+    assert conn.account_host == "https://accounts.cloud.databricks.com"
+    # unrecognised host -> keep the default
+    conn2 = Connection(account_host_explicit=False)
+    cli._resolve_account_host(conn2, _wc_host(None))
+    assert conn2.account_host == "https://accounts.cloud.databricks.com"
+
+
 def test_acl_preflight_azure_still_runs_assigned_policy_check(monkeypatch):
     # Skipping PrivateLink doesn't skip the existing-assigned-policy guard.
     import typer

@@ -24,6 +24,10 @@ class Connection:
     profile: str | None = None
     account_id: str = ""
     account_host: str = DEFAULT_ACCOUNT_HOST
+    # Whether --account-host was set explicitly. When False, the CLI derives the account host from the
+    # workspace's environment (so a staging / GCP / Azure workspace reaches the matching account API
+    # instead of the AWS prod default); an explicit host is always respected.
+    account_host_explicit: bool = False
     # A workspace OAuth session can't call the account API, so the account client uses its own
     # profile when given. If unset, unified auth resolves account creds from env / matching profile.
     account_profile: str | None = None

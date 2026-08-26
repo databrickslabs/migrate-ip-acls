@@ -98,6 +98,11 @@ options go straight after the program name.
   requires create + assign **and** `--policy-mode enforce`. Off by default.
 - `--account-id` (+ account-admin creds) — **always required** (pre-checks and create/assign are all
   account-level).
+- `--account-host` / `--account-profile` — account API host / a dedicated profile for account-level
+  calls. When `--account-host` isn't set it's **derived from the workspace's environment** (so an AWS
+  staging, GCP or Azure workspace reaches the matching account console instead of the AWS prod
+  default); pass `--account-host` to override, or `--account-profile` to use a specific profile's
+  host + creds.
 
 **Invalid flag combinations** (rejected up front): `--no-create-policy` with `--auto-assign` (nothing
 to bind); `--disable-existing-ip-acls` without both create + assign, or with `--policy-mode dry_run`
