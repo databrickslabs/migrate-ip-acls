@@ -222,7 +222,13 @@ def test_account_host_from_workspace_host():
         == "https://accounts.staging.cloud.databricks.com"
     )
     assert f("https://acme.cloud.databricks.com") == "https://accounts.cloud.databricks.com"
-    # GCP
+    # GCP: workspace hosts have TWO workspace-specific labels (<workspace-id>.<shard>) that the
+    # account console drops entirely — anchor on the shared base domain, don't strip one label.
+    assert (
+        f("https://1828143886076914.4.staging.gcp.databricks.com")
+        == "https://accounts.staging.gcp.databricks.com"
+    )
+    assert f("https://3062834477717148.8.gcp.databricks.com") == "https://accounts.gcp.databricks.com"
     assert f("https://1234.gcp.databricks.com") == "https://accounts.gcp.databricks.com"
     # Azure uses its fixed account host (the region label must NOT leak into it)
     assert f("https://adb-123.4.azuredatabricks.net") == "https://accounts.azuredatabricks.net"
