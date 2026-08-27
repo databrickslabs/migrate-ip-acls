@@ -96,13 +96,16 @@ options go straight after the program name.
   confirms). For a propose-only run use `--no-create-policy --no-auto-assign`.
 - `--disable-existing-ip-acls` — after create + assign, turn off the workspace's IP access lists;
   requires create + assign **and** `--policy-mode enforce`. Off by default.
-- `--account-id` (+ account-admin creds) — **always required** (pre-checks and create/assign are all
-  account-level).
+- `--account-id` (+ account-admin creds) — account-level (pre-checks and create/assign). When unset it
+  **defaults to the workspace profile's own `account_id`**, else prompts.
 - `--account-host` / `--account-profile` — account API host / a dedicated profile for account-level
   calls. When `--account-host` isn't set it's **derived from the workspace's environment** (so an AWS
   staging, GCP or Azure workspace reaches the matching account console instead of the AWS prod
-  default); pass `--account-host` to override, or `--account-profile` to use a specific profile's
-  host + creds.
+  default); pass `--account-host` to override. When `--account-profile` isn't set, the CLI
+  **auto-selects a config profile whose host + `account_id` both match** the target account (matching
+  on both, since an id alone is ambiguous), so account calls don't fall back to an ambient credential;
+  one match → used, none → unified auth (the account-access check then fails fast if it's wrong),
+  several → the first, with a note.
 
 **Invalid flag combinations** (rejected up front): `--no-create-policy` with `--auto-assign` (nothing
 to bind); `--disable-existing-ip-acls` without both create + assign, or with `--policy-mode dry_run`
