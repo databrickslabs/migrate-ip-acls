@@ -233,6 +233,161 @@ def test_maybe_disable_ip_acls_warns_on_sdk_failure(capsys):
     assert "manually" in out.lower()
 
 
+def test_verify_account_access_returns_account_and_ws_on_success():
+    from dbx_migrate_ip_acls.config import Connection
+
+    conn = Connection(account_id="acc", account_profile="acct-prof")
+    ws_obj = object()
+
+    class _OK:
+        def get(self, workspace_id):
+            return ws_obj
+
+    account = type("Acct", (), {"workspaces": _OK()})()
+    got_account, got_ws = cli._verify_account_access_or_exit(conn, account, 42)
+    assert got_account is account
+    assert got_ws is ws_obj
+
+
+def test_verify_account_access_exits_cleanly_on_rejection(capsys):
+    # a wrong-tenant / wrong-account / not-admin rejection must become a clean exit(1) with an
+    # actionable message — not a raw SDK traceback swallowed and surfaced later.
+    import typer
+
+    from dbx_migrate_ip_acls.config import Connection
+
+    conn = Connection(account_id="acc-123", account_host="https://accounts.azuredatabricks.net")
+
+    class _Bad:
+        def get(self, workspace_id):
+            raise RuntimeError("IncorrectClaimException: Expected iss claim to be ...")
+
+    account = type("Acct", (), {"workspaces": _Bad()})()
+    with pytest.raises(typer.Exit) as exc:
+        cli._verify_account_access_or_exit(conn, account, 42)
+    assert exc.value.exit_code == 1
+    out = _squash(capsys.readouterr().out)
+    # names the account it tried and points at the fix
+    assert "acc-123" in out
+    assert "--account-profile" in out
+
+
+def test_verify_account_access_message_flags_missing_account_profile(capsys):
+    import typer
+
+    from dbx_migrate_ip_acls.config import Connection
+
+    # no --account-profile -> the message must call out that creds came from ambient unified auth
+    conn = Connection(account_id="acc-9", profile="ws-prof")
+
+    class _Bad:
+        def get(self, workspace_id):
+            raise RuntimeError("boom")
+
+    with pytest.raises(typer.Exit):
+        cli._verify_account_access_or_exit(conn, type("Acct", (), {"workspaces": _Bad()})(), 42)
+    out = _squash(capsys.readouterr().out).lower()
+    assert "unifiedauth" in out  # "...resolved by unified auth..." (whitespace squashed)
+
+
+def test_verify_account_access_offers_reauth_then_retries(monkeypatch):
+    # expired account creds -> offer re-auth; on success, rebuild the client and retry the probe once.
+    from dbx_migrate_ip_acls import auth
+    from dbx_migrate_ip_acls.config import Connection
+
+    conn = Connection(account_id="acc", account_profile="acct-prof")
+    ws_obj = object()
+    calls = {"n": 0}
+
+    class _Expired:
+        def get(self, workspace_id):
+            calls["n"] += 1
+            raise ValueError("Cannot get access token; run: databricks auth login --profile acct-prof")
+
+    class _OK:
+        def get(self, workspace_id):
+            return ws_obj
+
+    monkeypatch.setattr(cli, "_reauthenticate", lambda profile: True)
+    monkeypatch.setattr(auth, "account_client", lambda conn: type("Acct", (), {"workspaces": _OK()})())
+
+    got_account, got_ws = cli._verify_account_access_or_exit(
+        conn, type("Acct", (), {"workspaces": _Expired()})(), 42
+    )
+    assert got_ws is ws_obj  # retry with the rebuilt client succeeded
+    assert calls["n"] == 1  # original client tried exactly once before re-auth
+
+
+def test_looks_like_account_console_detects_all_account_hosts():
+    f = cli._looks_like_account_console
+    assert f("https://accounts.cloud.databricks.com") is True
+    assert f("https://accounts.staging.cloud.databricks.com") is True
+    assert f("https://accounts.azuredatabricks.net") is True
+    assert f("https://accounts.gcp.databricks.com") is True
+    # workspace hosts are not account consoles
+    assert f("https://adb-7405612016848327.7.azuredatabricks.net") is False
+    assert f("https://dbc-8d247fe0-6d2c.cloud.databricks.com") is False
+    assert f("https://1234.gcp.databricks.com") is False
+    assert f("") is False
+    assert f(None) is False
+
+
+def _fake_wc(host, ws_id=42, raise_id=False):
+    cfg = type("Cfg", (), {"host": host})()
+
+    class _WC:
+        config = cfg
+
+        def get_workspace_id(self):
+            if raise_id:
+                raise ValueError("Expecting value: line 1 column 1 (char 0)")
+            return ws_id
+
+    return _WC()
+
+
+def test_confirm_workspace_rejects_account_console_profile(monkeypatch, capsys):
+    import typer
+
+    from dbx_migrate_ip_acls.config import Connection
+
+    # an account profile passed as the workspace --profile must fail fast (before the Y/N gate),
+    # not blow up later inside get_workspace_id.
+    monkeypatch.setattr(
+        cli, "_workspace_client_or_exit", lambda conn: _fake_wc("https://accounts.azuredatabricks.net")
+    )
+    with pytest.raises(typer.Exit) as exc:
+        cli._confirm_workspace(Connection(profile="az-cli-test-account"), yes=True)
+    assert exc.value.exit_code == 1
+    out = _squash(capsys.readouterr().out)
+    assert "accountconsole" in out.lower()
+    assert "--account-profile" in out
+
+
+def test_workspace_id_or_exit_returns_id_on_success():
+    assert cli._workspace_id_or_exit(_fake_wc("https://adb-1.7.azuredatabricks.net", ws_id=7)) == 7
+
+
+def test_workspace_id_or_exit_account_host_gives_account_profile_hint(capsys):
+    import typer
+
+    with pytest.raises(typer.Exit) as exc:
+        cli._workspace_id_or_exit(_fake_wc("https://accounts.azuredatabricks.net", raise_id=True))
+    assert exc.value.exit_code == 1
+    out = _squash(capsys.readouterr().out)
+    assert "--account-profile" in out
+
+
+def test_workspace_id_or_exit_other_failure_gives_generic_hint(capsys):
+    import typer
+
+    with pytest.raises(typer.Exit) as exc:
+        cli._workspace_id_or_exit(_fake_wc("https://adb-1.7.azuredatabricks.net", raise_id=True))
+    assert exc.value.exit_code == 1
+    out = _squash(capsys.readouterr().out).lower()
+    assert "workspaceid" in out  # "Couldn't read the workspace id ..." (whitespace squashed)
+
+
 def test_disable_without_create_is_rejected():
     # --disable-existing-ip-acls without a create+assign must fail up front (before any SDK call),
     # so the workspace can't be left unprotected. (create-policy defaults on, so force it off here.)
@@ -668,38 +823,28 @@ def test_acl_preflight_enforced_warns_and_proceeds_when_not_assigning(monkeypatc
     assert "isn't assigning" in capsys.readouterr().out
 
 
-def test_acl_preflight_dry_run_cancels_without_promote_noninteractive(monkeypatch):
+def test_acl_preflight_aborts_on_existing_dry_run_policy_when_assigning(monkeypatch, capsys):
+    # A dry-run assigned policy with ingress rules aborts too (regardless of enforce vs dry-run):
+    # promoting it and re-running was a dead end that just hit the enforced abort.
     import typer
 
     monkeypatch.setattr("dbx_migrate_ip_acls.acl.workspace_pas_attached", lambda a, w: False)
     monkeypatch.setattr("dbx_migrate_ip_acls.acl.account_registered_endpoint_count", lambda a: 0)
     monkeypatch.setattr("dbx_migrate_ip_acls.acl.assigned_ingress_state", lambda a, w: ("p1", "dry_run"))
-    promoted = {"n": 0}
-    monkeypatch.setattr(
-        "dbx_migrate_ip_acls.acl.promote_dry_run_to_enforced",
-        lambda *a, **k: promoted.__setitem__("n", promoted["n"] + 1),
-    )
     with pytest.raises(typer.Exit) as e:
-        cli._acl_preflight(object(), 42, will_assign=True, yes=True)  # --yes -> no prompt/promotion
-    assert e.value.exit_code == 0 and promoted["n"] == 0
+        cli._acl_preflight(object(), 42, will_assign=True, yes=True)
+    assert e.value.exit_code == 1
+    out = _squash(capsys.readouterr().out).lower()
+    assert "dry-run" in out and "aborting" in out
 
 
-def test_acl_preflight_dry_run_promotes_when_confirmed(monkeypatch):
-    import typer
-
+def test_acl_preflight_dry_run_warns_and_proceeds_when_not_assigning(monkeypatch, capsys):
+    # not assigning -> existing dry-run policy stays put; warn and continue (no abort).
     monkeypatch.setattr("dbx_migrate_ip_acls.acl.workspace_pas_attached", lambda a, w: False)
     monkeypatch.setattr("dbx_migrate_ip_acls.acl.account_registered_endpoint_count", lambda a: 0)
     monkeypatch.setattr("dbx_migrate_ip_acls.acl.assigned_ingress_state", lambda a, w: ("p1", "dry_run"))
-    promoted = {"n": 0}
-    monkeypatch.setattr(
-        "dbx_migrate_ip_acls.acl.promote_dry_run_to_enforced",
-        lambda *a, **k: promoted.__setitem__("n", promoted["n"] + 1),
-    )
-    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
-    monkeypatch.setattr("typer.confirm", lambda *a, **k: True)
-    with pytest.raises(typer.Exit) as e:
-        cli._acl_preflight(object(), 42, will_assign=True, yes=False)
-    assert e.value.exit_code == 0 and promoted["n"] == 1  # promoted, then migration cancelled
+    cli._acl_preflight(object(), 42, will_assign=False, yes=True)  # must not raise
+    assert "isn't assigning" in capsys.readouterr().out
 
 
 def test_acl_preflight_passes_when_clean(monkeypatch):

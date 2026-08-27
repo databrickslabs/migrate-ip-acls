@@ -130,14 +130,32 @@ def account_host_from_workspace_host(host: str | None) -> str | None:
     return None
 
 
-def workspace_cloud(account, workspace_id, host: str | None = None) -> str | None:
+def verify_account_access(account, workspace_id):
+    """Make one real account-API call up front (fetch this workspace via the account API) so a bad
+    account credential fails FAST with a clear message. Every other account reader here
+    (`workspace_cloud`, `workspace_pas_attached`, `account_registered_endpoint_count`,
+    `assigned_ingress_state`, `assigned_egress`) is deliberately best-effort — it swallows errors and
+    degrades to a safe-ish default. That's right once we know the account client works, but if it
+    *doesn't* (wrong account, wrong Azure AD tenant, missing account-admin rights) those swallows
+    would silently produce wrong results — skipped PrivateLink checks, or a FULL_ACCESS egress
+    instead of the copied one — and the failure would only surface much later as a raw SDK traceback
+    from the first reader that happens not to catch it (`policy_exists`). Probing here converts all
+    of that into one clean, early error. Returns the workspace object (callers reuse it for cloud
+    detection); the underlying SDK error propagates on failure."""
+    return account.workspaces.get(workspace_id=int(workspace_id))
+
+
+def workspace_cloud(account, workspace_id, host: str | None = None, ws: object | None = None) -> str | None:
     """This workspace's cloud — 'aws', 'azure', or 'gcp'. Prefers the authoritative `cloud` field on
     the account workspaces API; when that's empty (it frequently is — e.g. AWS workspaces report no
     cloud), falls back to inferring it from the workspace `host` URL's domain. None if neither yields
     an answer. Used to drive per-cloud behaviour (today: skipping the PrivateLink pre-checks on
-    Azure). Best-effort — a read failure degrades to the host fallback rather than crashing."""
+    Azure). Pass `ws` to reuse an already-fetched workspace object (e.g. from verify_account_access)
+    instead of making a second account call. Best-effort — a read failure degrades to the host
+    fallback rather than crashing."""
     try:
-        ws = account.workspaces.get(workspace_id=int(workspace_id))
+        if ws is None:
+            ws = account.workspaces.get(workspace_id=int(workspace_id))
         cloud = (getattr(ws, "cloud", None) or "").strip().lower()
         if cloud:
             return cloud
@@ -297,15 +315,6 @@ def assigned_egress(account, workspace_id) -> tuple[str | None, object | None]:
     except Exception:  # noqa: BLE001 - NotFound / read failure → caller uses FULL_ACCESS
         return None, None
     return DEFAULT_POLICY_ID, copy.deepcopy(getattr(default, "egress", None))
-
-
-def promote_dry_run_to_enforced(account, policy_id: str, note: Note = lambda _m: None) -> None:
-    """Move a policy's dry-run ingress block into the enforced ingress slot (clearing dry-run)."""
-    pol = account.network_policies.get_network_policy_rpc(network_policy_id=policy_id)
-    pol.ingress = pol.ingress_dry_run
-    pol.ingress_dry_run = None
-    account.network_policies.update_network_policy_rpc(network_policy_id=policy_id, network_policy=pol)
-    note(f"Promoted network policy '{policy_id}' from dry-run to enforced ingress.")
 
 
 def disable_ip_access_lists(workspace_client, note: Note = lambda _m: None) -> bool:

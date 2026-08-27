@@ -3,6 +3,8 @@ queries, and the IP-ACL enforcement toggle."""
 
 from __future__ import annotations
 
+import pytest
+
 from dbx_migrate_ip_acls import acl as acl_core
 from dbx_migrate_ip_acls.config import AclConfig
 
@@ -255,6 +257,45 @@ def test_workspace_cloud_falls_back_to_host_when_api_empty_or_unreadable():
     assert acl_core.workspace_cloud(_cloud_account(None), 42, host=None) is None
 
 
+def test_verify_account_access_returns_workspace_and_propagates_errors():
+    ws_obj = object()
+
+    class _OK:
+        def get(self, workspace_id):
+            assert workspace_id == 42  # coerced to int
+            return ws_obj
+
+    acct_ok = type("Acct", (), {"workspaces": _OK()})()
+    assert acl_core.verify_account_access(acct_ok, "42") is ws_obj
+
+    # a bad credential / permission / tenant error is NOT swallowed — it propagates so the caller
+    # can fail fast (the whole point of the probe).
+    class _Bad:
+        def get(self, workspace_id):
+            raise RuntimeError("IncorrectClaimException: wrong tenant")
+
+    acct_bad = type("Acct", (), {"workspaces": _Bad()})()
+    with pytest.raises(RuntimeError):
+        acl_core.verify_account_access(acct_bad, 42)
+
+
+def test_workspace_cloud_reuses_prefetched_ws_without_a_second_call():
+    # when ws= is supplied, workspace_cloud must NOT hit the account API again.
+    class _Boom:
+        def get(self, workspace_id):
+            raise AssertionError("must not fetch when ws= is supplied")
+
+    acct = type("Acct", (), {"workspaces": _Boom()})()
+    assert acl_core.workspace_cloud(acct, 42, ws=type("W", (), {"cloud": "azure"})()) == "azure"
+    # an empty cloud on the prefetched object still falls back to the host
+    assert (
+        acl_core.workspace_cloud(
+            acct, 42, host="https://x.gcp.databricks.com", ws=type("W", (), {"cloud": None})()
+        )
+        == "gcp"
+    )
+
+
 def test_workspace_pas_attached_true_false():
     assert acl_core.workspace_pas_attached(_pas_account("pas-abc"), 42) is True
     assert acl_core.workspace_pas_attached(_pas_account(None), 42) is False
@@ -403,25 +444,6 @@ def test_assigned_ingress_state_enforced_dry_run_when_restrictive():
     assert acl_core.assigned_ingress_state(_policy_account("p1", enforced), 42) == ("p1", "enforced")
     dry = type("P", (), {"ingress": None, "ingress_dry_run": _ingress(public_mode="RESTRICTED_ACCESS")})()
     assert acl_core.assigned_ingress_state(_policy_account("p2", dry), 42) == ("p2", "dry_run")
-
-
-def test_promote_dry_run_to_enforced_moves_block():
-    sent = {}
-    dry_block = object()
-    pol = type("P", (), {"ingress": None, "ingress_dry_run": dry_block})()
-
-    class _NP:
-        def get_network_policy_rpc(self, network_policy_id):
-            return pol
-
-        def update_network_policy_rpc(self, network_policy_id, network_policy):
-            sent["id"] = network_policy_id
-            sent["pol"] = network_policy
-
-    acct = type("Acct", (), {"network_policies": _NP()})()
-    acl_core.promote_dry_run_to_enforced(acct, "p1")
-    assert sent["id"] == "p1"
-    assert sent["pol"].ingress is dry_block and sent["pol"].ingress_dry_run is None
 
 
 def test_acl_policy_payload_is_curl_ready():

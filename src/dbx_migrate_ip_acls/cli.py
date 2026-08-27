@@ -273,6 +273,106 @@ def _account_client_or_exit(conn: Connection):
     )
 
 
+def _account_access_error(e: Exception, conn: Connection) -> None:
+    """Clean, actionable exit when the account API rejects our credentials — wrong account, wrong
+    Azure AD / Entra tenant, missing account-admin rights, or (with no --account-profile) no account
+    creds resolved for the account host at all. Always raises."""
+    if conn.account_profile:
+        creds = f"the --account-profile '{conn.account_profile}' credentials"
+    else:
+        creds = (
+            "the account credentials resolved by unified auth — no --account-profile was given, so "
+            "they came from $DATABRICKS_* / an auto-discovered profile / a cached cloud login, which "
+            "may be for a different tenant or account"
+        )
+    detail = " ".join(str(e).split())[:300] or type(e).__name__
+    console.banner(
+        "danger",
+        f"Couldn't access the Databricks account API at {conn.account_host} for account "
+        f"'{conn.account_id}' using {creds}.\n"
+        f"  The API rejected the request: {type(e).__name__}: {detail}\n"
+        "  This usually means those credentials are for a different account, or (on Azure) a "
+        "different Entra ID / AAD tenant than the account console, or lack account-admin rights.\n"
+        "  Fix: pass --account-profile <name> for an account-admin login to THIS account "
+        "(create one with `databricks auth login --host <account-console-url>`), then re-run.",
+    )
+    raise typer.Exit(code=1) from None
+
+
+def _verify_account_access_or_exit(conn: Connection, account, workspace_id):
+    """Probe the account API once, right after the account client is built, so a bad account
+    credential fails fast with an actionable message instead of being silently swallowed by the
+    best-effort account readers (and only surfacing later as a raw SDK traceback). On expired creds,
+    offers the same re-auth flow as client construction and retries once with a fresh client. Returns
+    (account, workspace_object) — the account client may be rebuilt by a re-auth, so callers must
+    adopt the returned one."""
+    from . import acl as acl_core
+    from . import auth
+
+    prof = conn.account_profile or conn.profile
+    retried = False
+    while True:
+        try:
+            return account, acl_core.verify_account_access(account, workspace_id)
+        except Exception as e:  # noqa: BLE001 - any account-API failure becomes a clean exit
+            msg = str(e)
+            if not retried and _is_expired_auth(msg):
+                reauth = _reauth_profile(msg, prof)
+                if reauth and _reauthenticate(reauth):
+                    account = auth.account_client(conn)  # rebuild with the refreshed credentials
+                    retried = True
+                    continue
+            _account_access_error(e, conn)
+
+
+def _looks_like_account_console(host: str | None) -> bool:
+    """True if this host is a Databricks *account* console (accounts.cloud.databricks.com,
+    accounts.staging.cloud.databricks.com, accounts.azuredatabricks.net, accounts.gcp.databricks.com)
+    rather than a workspace. Used to catch an --account-profile mistakenly passed as the workspace
+    --profile before we call workspace-only APIs (e.g. /scim/v2/Me) on it — those return non-JSON on
+    an account host and would otherwise blow up as a raw JSONDecodeError."""
+    if not host:
+        return False
+    from urllib.parse import urlparse
+
+    netloc = urlparse(host if "://" in host else f"https://{host}").netloc.lower()
+    return netloc.startswith("accounts.")
+
+
+def _account_profile_as_workspace_error(host: str) -> None:
+    """Clean, actionable exit when the workspace --profile resolves to an account console host.
+    Always raises."""
+    console.banner(
+        "danger",
+        f"The workspace profile resolves to a Databricks account console ({host}), not a workspace "
+        "— it looks like an account profile was passed as --profile.\n"
+        "  Pass a WORKSPACE profile as --profile (its host is an adb-* / dbc-* workspace URL), and "
+        "put the account profile in --account-profile.",
+    )
+    raise typer.Exit(code=1)
+
+
+def _workspace_id_or_exit(wc) -> int:
+    """Resolve the workspace id, turning an SDK failure into a clean, actionable message instead of a
+    raw traceback. The common cause is a profile that points at an account console (workspace-only
+    APIs like /scim/v2/Me return non-JSON there → JSONDecodeError)."""
+    try:
+        return wc.get_workspace_id()
+    except Exception as e:  # noqa: BLE001 - any failure becomes a clean exit
+        try:
+            host = (wc.config.host or "").rstrip("/")
+        except Exception:  # noqa: BLE001
+            host = ""
+        if _looks_like_account_console(host):
+            _account_profile_as_workspace_error(host)
+        console.banner(
+            "danger",
+            f"Couldn't read the workspace id from {host or 'the workspace'} ({type(e).__name__}). "
+            "Check that --profile points at a reachable Databricks workspace.",
+        )
+        raise typer.Exit(code=1) from None
+
+
 def _confirm_workspace(conn: Connection, yes: bool):
     """Resolve the workspace client and surface exactly which workspace this run reads from and (on
     apply) modifies — profile, URL, id — then gate on Y/N so the target can't be mistaken. Always
@@ -285,6 +385,10 @@ def _confirm_workspace(conn: Connection, yes: bool):
         host = (wc.config.host or "").rstrip("/") or "unknown"
     except Exception:  # noqa: BLE001 - display best-effort; real auth errors surface later in use
         host = "unknown"
+    # A profile pointing at an account console can't be migrated (it's not a workspace) and would
+    # otherwise fail deep inside get_workspace_id with a raw JSONDecodeError — catch it up front.
+    if _looks_like_account_console(host):
+        _account_profile_as_workspace_error(host)
     try:
         ws_id = wc.get_workspace_id()
     except Exception:  # noqa: BLE001
@@ -335,14 +439,12 @@ def _acl_preflight(account, workspace_id, will_assign: bool, yes: bool, is_azure
       Both PrivateLink checks are skipped on Azure, which has neither a PAS nor account VPC
       endpoints — an Azure workspace only needs its IP access lists migrated.
     * An existing assigned CBI ingress policy only matters when this run will **assign** the new
-      policy (assigning would replace the existing one). When assigning:
-        - enforced existing policy -> abort (migrating on top of it isn't supported yet);
-        - dry-run existing policy   -> flag, offer to promote it to enforced, then stop (a migration
-          needs an enforced baseline first).
+      policy (assigning would replace the existing one). When assigning, an assigned policy that has
+      restrictive ingress rules — enforced OR dry-run — aborts: migrating on top of an existing CBI
+      ingress policy isn't supported yet. (A dry-run policy used to offer promotion to enforced then
+      a re-run, but that was a dead end — the re-run just hit this same abort.)
       When NOT assigning (propose-only, --export, or --no-auto-assign) the workspace's binding is
       untouched, so we just warn and let the run create/export the (unbound) policy."""
-    import sys
-
     from . import acl as acl_core
 
     if is_azure:
@@ -350,9 +452,8 @@ def _acl_preflight(account, workspace_id, will_assign: bool, yes: bool, is_azure
         # PrivateLink pre-check applies — skip both and migrate the IP access lists only.
         console.banner(
             "info",
-            "Azure workspace detected — Azure has no Private Access Settings or VPC-endpoint "
-            "(PrivateLink) concept, so those pre-checks are skipped; only the IP access lists are "
-            "migrated.",
+            "Azure workspace detected — Azure has no Private Access Settings so these pre-checks "
+            "are skipped; only the IP access lists are migrated.",
         )
     else:
         pas = acl_core.workspace_pas_attached(account, workspace_id)
@@ -404,38 +505,16 @@ def _acl_preflight(account, workspace_id, will_assign: bool, yes: bool, is_azure
         )
         return
 
-    if state == "enforced":
-        console.banner(
-            "danger",
-            f"This workspace already has an ENFORCED CBI ingress policy "
-            f"('{assigned_id}'). Migrating on top of an existing enforced policy "
-            "is NOT supported yet - aborting.",
-        )
-        raise typer.Exit(code=1)
-
-    # dry-run only, and we're about to assign a replacement
+    # An assigned policy with restrictive ingress rules — enforced OR dry-run — can't be migrated on
+    # top of yet, so abort in both cases. (Promoting a dry-run to enforced and telling the user to
+    # re-run was a dead end: the re-run would just hit this same abort.)
+    kind = "an ENFORCED" if state == "enforced" else "a DRY-RUN"
     console.banner(
-        "warn",
-        f"This workspace has a DRY-RUN CBI ingress policy ('{assigned_id}') with "
-        "no enforced ingress. A migration needs an enforced baseline first.",
+        "danger",
+        f"This workspace already has {kind} CBI ingress policy ('{assigned_id}') with ingress "
+        "rules. Migrating on top of an existing CBI ingress policy is NOT supported yet - aborting.",
     )
-    if (
-        not yes
-        and sys.stdin.isatty()
-        and typer.confirm(
-            typer.style(f"Promote '{assigned_id}' from dry-run to enforced now?", fg="yellow"), default=False
-        )
-    ):
-        with console.status("Promoting policy to enforced…"):
-            acl_core.promote_dry_run_to_enforced(
-                account, assigned_id, note=lambda m: console.banner("info", m)
-            )
-        console.banner(
-            "info",
-            "Promoted to enforced. Re-run the migration to continue now that an " "enforced baseline exists.",
-        )
-    console.banner("info", "Migration cancelled.")
-    raise typer.Exit(code=0)
+    raise typer.Exit(code=1)
 
 
 def _confirm_overwrite(dest, yes: bool) -> bool:
@@ -846,16 +925,22 @@ def _run_acl(cfg: AclConfig, conn: Connection, yes: bool) -> None:
     # table or prompting about disabled lists. That way an unsupported workspace (PrivateLink) or an
     # existing enforced CBI policy fails fast, instead of after the user has scrolled the ACL table,
     # picked disabled rules, and entered an account_id.
-    ws_id = wc.get_workspace_id()
+    ws_id = _workspace_id_or_exit(wc)
     _ensure_account_id(conn, "Migrating an IP ACL (checks PrivateLink + the existing assigned policy)")
     account = _account_client_or_exit(conn)
+    # Probe the account API once so a bad account credential (wrong account, wrong Azure AD tenant,
+    # or not account-admin) fails fast with a clear message here — rather than being silently
+    # swallowed by the best-effort readers below (which would degrade to skipped PrivateLink checks
+    # and a FULL_ACCESS egress) and only exploding later in policy_exists. Returns the workspace
+    # object (reused for cloud detection) and the possibly-rebuilt account client.
+    account, ws_obj = _verify_account_access_or_exit(conn, account, ws_id)
     # Azure has no Private Access Settings / VPC-endpoint (PrivateLink) concept, so those pre-checks
     # are skipped there. Resolve the cloud from the account workspaces API `cloud` field, falling back
     # to the workspace host's domain when the API doesn't populate it (it frequently doesn't). An
     # unknown cloud defaults to non-Azure so the checks stay on (they never falsely abort on Azure
     # anyway — it has no PAS and no back-end network config).
     ws_host = getattr(getattr(wc, "config", None), "host", None)
-    cloud = acl_core.workspace_cloud(account, ws_id, host=ws_host)
+    cloud = acl_core.workspace_cloud(account, ws_id, host=ws_host, ws=ws_obj)
     is_azure = cloud == "azure"
     # An existing assigned policy is only replaced if we're going to assign the new one.
     _acl_preflight(
