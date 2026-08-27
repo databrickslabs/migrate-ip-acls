@@ -4,8 +4,8 @@ name: Release
 # publishes them to PyPI via Trusted Publishing (OIDC) — no stored token, no manual upload step.
 #
 # One-time setup on PyPI (Project → Publishing, or a "pending publisher" before the first release):
-#   Owner:            andyweaves
-#   Repository:       databricks-migrate-ip-acls
+#   Owner:            databrickslabs
+#   Repository:       migrate-ip-acls
 #   Workflow name:    release.yml
 #   Environment name: pypi
 on:
