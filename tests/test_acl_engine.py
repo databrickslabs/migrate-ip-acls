@@ -208,6 +208,9 @@ def test_cloud_from_host_maps_all_three_clouds():
     assert acl_core.cloud_from_host("https://x.gcp.databricks.com") == "gcp"
     assert acl_core.cloud_from_host("https://dbc-abc.cloud.databricks.com") == "aws"
     assert acl_core.cloud_from_host("https://sfe-csp.cloud.databricks.com") == "aws"
+    # vanity / custom workspace subdomains still map by their base domain
+    assert acl_core.cloud_from_host("https://acme.cloud.databricks.com") == "aws"
+    assert acl_core.cloud_from_host("https://acme.gcp.databricks.com") == "gcp"
     assert acl_core.cloud_from_host("") is None
     assert acl_core.cloud_from_host(None) is None
     assert acl_core.cloud_from_host("https://example.com") is None
@@ -230,9 +233,17 @@ def test_account_host_from_workspace_host():
     )
     assert f("https://3062834477717148.8.gcp.databricks.com") == "https://accounts.gcp.databricks.com"
     assert f("https://1234.gcp.databricks.com") == "https://accounts.gcp.databricks.com"
+    # Custom/vanity workspace subdomains (e.g. acme.<base>) resolve to the shared account console:
+    # AWS drops the single vanity label; GCP anchors on the base domain (handles the vanity label too).
+    # (prod AWS vanity `acme.cloud.databricks.com` is covered above.)
+    assert f("https://acme.staging.cloud.databricks.com") == "https://accounts.staging.cloud.databricks.com"
+    assert f("https://acme.gcp.databricks.com") == "https://accounts.gcp.databricks.com"
+    assert f("https://acme.staging.gcp.databricks.com") == "https://accounts.staging.gcp.databricks.com"
     # Azure uses its fixed account host (the region label must NOT leak into it)
     assert f("https://adb-123.4.azuredatabricks.net") == "https://accounts.azuredatabricks.net"
-    # undecidable / empty -> None (caller keeps its default)
+    # undecidable (fully white-labeled apex domain) / empty -> None; caller keeps its default and the
+    # user can pin --account-host.
+    assert f("https://databricks.acme.example") is None
     assert f("https://example.com") is None
     assert f("") is None
     assert f(None) is None
