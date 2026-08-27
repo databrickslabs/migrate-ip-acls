@@ -233,6 +233,91 @@ def test_maybe_disable_ip_acls_warns_on_sdk_failure(capsys):
     assert "manually" in out.lower()
 
 
+def test_verify_account_access_returns_account_and_ws_on_success():
+    from dbx_migrate_ip_acls.config import Connection
+
+    conn = Connection(account_id="acc", account_profile="acct-prof")
+    ws_obj = object()
+
+    class _OK:
+        def get(self, workspace_id):
+            return ws_obj
+
+    account = type("Acct", (), {"workspaces": _OK()})()
+    got_account, got_ws = cli._verify_account_access_or_exit(conn, account, 42)
+    assert got_account is account
+    assert got_ws is ws_obj
+
+
+def test_verify_account_access_exits_cleanly_on_rejection(capsys):
+    # a wrong-tenant / wrong-account / not-admin rejection must become a clean exit(1) with an
+    # actionable message — not a raw SDK traceback swallowed and surfaced later.
+    import typer
+
+    from dbx_migrate_ip_acls.config import Connection
+
+    conn = Connection(account_id="acc-123", account_host="https://accounts.azuredatabricks.net")
+
+    class _Bad:
+        def get(self, workspace_id):
+            raise RuntimeError("IncorrectClaimException: Expected iss claim to be ...")
+
+    account = type("Acct", (), {"workspaces": _Bad()})()
+    with pytest.raises(typer.Exit) as exc:
+        cli._verify_account_access_or_exit(conn, account, 42)
+    assert exc.value.exit_code == 1
+    out = _squash(capsys.readouterr().out)
+    # names the account it tried and points at the fix
+    assert "acc-123" in out
+    assert "--account-profile" in out
+
+
+def test_verify_account_access_message_flags_missing_account_profile(capsys):
+    import typer
+
+    from dbx_migrate_ip_acls.config import Connection
+
+    # no --account-profile -> the message must call out that creds came from ambient unified auth
+    conn = Connection(account_id="acc-9", profile="ws-prof")
+
+    class _Bad:
+        def get(self, workspace_id):
+            raise RuntimeError("boom")
+
+    with pytest.raises(typer.Exit):
+        cli._verify_account_access_or_exit(conn, type("Acct", (), {"workspaces": _Bad()})(), 42)
+    out = _squash(capsys.readouterr().out).lower()
+    assert "unifiedauth" in out  # "...resolved by unified auth..." (whitespace squashed)
+
+
+def test_verify_account_access_offers_reauth_then_retries(monkeypatch):
+    # expired account creds -> offer re-auth; on success, rebuild the client and retry the probe once.
+    from dbx_migrate_ip_acls import auth
+    from dbx_migrate_ip_acls.config import Connection
+
+    conn = Connection(account_id="acc", account_profile="acct-prof")
+    ws_obj = object()
+    calls = {"n": 0}
+
+    class _Expired:
+        def get(self, workspace_id):
+            calls["n"] += 1
+            raise ValueError("Cannot get access token; run: databricks auth login --profile acct-prof")
+
+    class _OK:
+        def get(self, workspace_id):
+            return ws_obj
+
+    monkeypatch.setattr(cli, "_reauthenticate", lambda profile: True)
+    monkeypatch.setattr(auth, "account_client", lambda conn: type("Acct", (), {"workspaces": _OK()})())
+
+    got_account, got_ws = cli._verify_account_access_or_exit(
+        conn, type("Acct", (), {"workspaces": _Expired()})(), 42
+    )
+    assert got_ws is ws_obj  # retry with the rebuilt client succeeded
+    assert calls["n"] == 1  # original client tried exactly once before re-auth
+
+
 def test_disable_without_create_is_rejected():
     # --disable-existing-ip-acls without a create+assign must fail up front (before any SDK call),
     # so the workspace can't be left unprotected. (create-policy defaults on, so force it off here.)

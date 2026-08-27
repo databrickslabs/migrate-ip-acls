@@ -273,6 +273,58 @@ def _account_client_or_exit(conn: Connection):
     )
 
 
+def _account_access_error(e: Exception, conn: Connection) -> None:
+    """Clean, actionable exit when the account API rejects our credentials — wrong account, wrong
+    Azure AD / Entra tenant, missing account-admin rights, or (with no --account-profile) no account
+    creds resolved for the account host at all. Always raises."""
+    if conn.account_profile:
+        creds = f"the --account-profile '{conn.account_profile}' credentials"
+    else:
+        creds = (
+            "the account credentials resolved by unified auth — no --account-profile was given, so "
+            "they came from $DATABRICKS_* / an auto-discovered profile / a cached cloud login, which "
+            "may be for a different tenant or account"
+        )
+    detail = " ".join(str(e).split())[:300] or type(e).__name__
+    console.banner(
+        "danger",
+        f"Couldn't access the Databricks account API at {conn.account_host} for account "
+        f"'{conn.account_id}' using {creds}.\n"
+        f"  The API rejected the request: {type(e).__name__}: {detail}\n"
+        "  This usually means those credentials are for a different account, or (on Azure) a "
+        "different Entra ID / AAD tenant than the account console, or lack account-admin rights.\n"
+        "  Fix: pass --account-profile <name> for an account-admin login to THIS account "
+        "(create one with `databricks auth login --host <account-console-url>`), then re-run.",
+    )
+    raise typer.Exit(code=1) from None
+
+
+def _verify_account_access_or_exit(conn: Connection, account, workspace_id):
+    """Probe the account API once, right after the account client is built, so a bad account
+    credential fails fast with an actionable message instead of being silently swallowed by the
+    best-effort account readers (and only surfacing later as a raw SDK traceback). On expired creds,
+    offers the same re-auth flow as client construction and retries once with a fresh client. Returns
+    (account, workspace_object) — the account client may be rebuilt by a re-auth, so callers must
+    adopt the returned one."""
+    from . import acl as acl_core
+    from . import auth
+
+    prof = conn.account_profile or conn.profile
+    retried = False
+    while True:
+        try:
+            return account, acl_core.verify_account_access(account, workspace_id)
+        except Exception as e:  # noqa: BLE001 - any account-API failure becomes a clean exit
+            msg = str(e)
+            if not retried and _is_expired_auth(msg):
+                reauth = _reauth_profile(msg, prof)
+                if reauth and _reauthenticate(reauth):
+                    account = auth.account_client(conn)  # rebuild with the refreshed credentials
+                    retried = True
+                    continue
+            _account_access_error(e, conn)
+
+
 def _confirm_workspace(conn: Connection, yes: bool):
     """Resolve the workspace client and surface exactly which workspace this run reads from and (on
     apply) modifies — profile, URL, id — then gate on Y/N so the target can't be mistaken. Always
@@ -849,13 +901,19 @@ def _run_acl(cfg: AclConfig, conn: Connection, yes: bool) -> None:
     ws_id = wc.get_workspace_id()
     _ensure_account_id(conn, "Migrating an IP ACL (checks PrivateLink + the existing assigned policy)")
     account = _account_client_or_exit(conn)
+    # Probe the account API once so a bad account credential (wrong account, wrong Azure AD tenant,
+    # or not account-admin) fails fast with a clear message here — rather than being silently
+    # swallowed by the best-effort readers below (which would degrade to skipped PrivateLink checks
+    # and a FULL_ACCESS egress) and only exploding later in policy_exists. Returns the workspace
+    # object (reused for cloud detection) and the possibly-rebuilt account client.
+    account, ws_obj = _verify_account_access_or_exit(conn, account, ws_id)
     # Azure has no Private Access Settings / VPC-endpoint (PrivateLink) concept, so those pre-checks
     # are skipped there. Resolve the cloud from the account workspaces API `cloud` field, falling back
     # to the workspace host's domain when the API doesn't populate it (it frequently doesn't). An
     # unknown cloud defaults to non-Azure so the checks stay on (they never falsely abort on Azure
     # anyway — it has no PAS and no back-end network config).
     ws_host = getattr(getattr(wc, "config", None), "host", None)
-    cloud = acl_core.workspace_cloud(account, ws_id, host=ws_host)
+    cloud = acl_core.workspace_cloud(account, ws_id, host=ws_host, ws=ws_obj)
     is_azure = cloud == "azure"
     # An existing assigned policy is only replaced if we're going to assign the new one.
     _acl_preflight(
