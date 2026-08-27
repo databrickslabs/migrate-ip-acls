@@ -317,15 +317,6 @@ def assigned_egress(account, workspace_id) -> tuple[str | None, object | None]:
     return DEFAULT_POLICY_ID, copy.deepcopy(getattr(default, "egress", None))
 
 
-def promote_dry_run_to_enforced(account, policy_id: str, note: Note = lambda _m: None) -> None:
-    """Move a policy's dry-run ingress block into the enforced ingress slot (clearing dry-run)."""
-    pol = account.network_policies.get_network_policy_rpc(network_policy_id=policy_id)
-    pol.ingress = pol.ingress_dry_run
-    pol.ingress_dry_run = None
-    account.network_policies.update_network_policy_rpc(network_policy_id=policy_id, network_policy=pol)
-    note(f"Promoted network policy '{policy_id}' from dry-run to enforced ingress.")
-
-
 def disable_ip_access_lists(workspace_client, note: Note = lambda _m: None) -> bool:
     """Turn OFF workspace-wide IP access list enforcement via `enableIpAccessLists=false`.
 

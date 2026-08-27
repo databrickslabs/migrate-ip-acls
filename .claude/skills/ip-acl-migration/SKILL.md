@@ -57,10 +57,10 @@ options go straight after the program name.
      any PrivateLink account is blocked for now (this limitation lifts once CBI private access GAs).
    - **Existing *restrictive* CBI ingress policy?** Only matters when the run will **assign** the new
      policy, and only for a policy that **actually restricts traffic** — an allow-all policy such as
-     the account's baseline `default-policy` is ignored. When assigning over a restrictive one: an
-     **enforced** policy → **aborts**; a **dry-run** policy → flags it, offers to **promote it to
-     enforced**, then **stops** (a migration needs an enforced baseline first; re-run afterwards).
-     When **not** assigning (propose-only, `--export`, `--no-auto-assign`), it just **warns**.
+     the account's baseline `default-policy` is ignored. When assigning over a restrictive one —
+     **enforced or dry-run** — it **aborts** (migrating on top of an existing CBI ingress policy
+     isn't supported yet). When **not** assigning (propose-only, `--export`, `--no-auto-assign`), it
+     just **warns**.
 4. Names the new policy from `--policy-name`; if not given it **prompts** for one (leave blank there
    to use the profile name). It only **creates new** policies, so if the chosen name already exists it
    re-prompts (interactively) or aborts. `--create-policy` is **on by default** (an interactive review

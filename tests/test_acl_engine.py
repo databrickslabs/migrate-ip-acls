@@ -446,25 +446,6 @@ def test_assigned_ingress_state_enforced_dry_run_when_restrictive():
     assert acl_core.assigned_ingress_state(_policy_account("p2", dry), 42) == ("p2", "dry_run")
 
 
-def test_promote_dry_run_to_enforced_moves_block():
-    sent = {}
-    dry_block = object()
-    pol = type("P", (), {"ingress": None, "ingress_dry_run": dry_block})()
-
-    class _NP:
-        def get_network_policy_rpc(self, network_policy_id):
-            return pol
-
-        def update_network_policy_rpc(self, network_policy_id, network_policy):
-            sent["id"] = network_policy_id
-            sent["pol"] = network_policy
-
-    acct = type("Acct", (), {"network_policies": _NP()})()
-    acl_core.promote_dry_run_to_enforced(acct, "p1")
-    assert sent["id"] == "p1"
-    assert sent["pol"].ingress is dry_block and sent["pol"].ingress_dry_run is None
-
-
 def test_acl_policy_payload_is_curl_ready():
     # --export builds the full AccountNetworkPolicy (ingress mode block + a FULL_ACCESS egress by
     # default, when no egress is carried over) as a dict.

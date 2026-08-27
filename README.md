@@ -88,8 +88,7 @@ flowchart TD
     ACCT --> PAS{"PrivateLink? (non-Azure only: workspace PAS<br/>attached or account VPC endpoints > 0)"}
     PAS -->|yes| X2["ABORT — not supported yet"]
     PAS -->|"no / Azure (checks skipped)"| AS0{"Will create AND assign?"}
-    AS0 -->|"yes: existing ENFORCED CBI policy"| X3["ABORT"]
-    AS0 -->|"yes: existing DRY-RUN CBI policy"| PROM["Warn; offer to promote to enforced, then stop"]
+    AS0 -->|"yes: existing CBI policy with ingress rules<br/>(enforced OR dry-run)"| X3["ABORT — not supported yet"]
     AS0 -->|"yes: none / allow-all"| GATE{"enableIpAccessLists × rule count<br/>(read IP access lists)"}
     AS0 -->|"no: propose-only"| GATE
     GATE -->|"enabled + 0 rules"| X4["No rules — nothing to migrate, stop"]
@@ -135,9 +134,9 @@ flowchart TD
    access isn't GA yet, so any PrivateLink account is blocked for now) — not supported yet; **both
    PrivateLink checks are skipped on Azure**, which has neither concept, so an Azure workspace only
    migrates its IP ACLs; and, only when the run will **assign** the new policy, guards an existing
-   **restrictive** CBI ingress policy
-   already bound to the workspace (enforced → abort; dry-run → offer to promote it to enforced, then
-   stop). An allow-all policy such as the account's baseline `default-policy` is ignored.
+   **restrictive** CBI ingress policy already bound to the workspace — enforced **or** dry-run →
+   **abort** (migrating on top of an existing CBI ingress policy isn't supported yet). An allow-all
+   policy such as the account's baseline `default-policy` is ignored.
 2. Then decides whether there's anything to migrate, from the workspace-wide `enableIpAccessLists`
    toggle × the number of IP access lists:
    - **disabled + 0 rules** → nothing to migrate → exit.

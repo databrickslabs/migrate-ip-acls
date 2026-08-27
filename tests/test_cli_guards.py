@@ -823,38 +823,28 @@ def test_acl_preflight_enforced_warns_and_proceeds_when_not_assigning(monkeypatc
     assert "isn't assigning" in capsys.readouterr().out
 
 
-def test_acl_preflight_dry_run_cancels_without_promote_noninteractive(monkeypatch):
+def test_acl_preflight_aborts_on_existing_dry_run_policy_when_assigning(monkeypatch, capsys):
+    # A dry-run assigned policy with ingress rules aborts too (regardless of enforce vs dry-run):
+    # promoting it and re-running was a dead end that just hit the enforced abort.
     import typer
 
     monkeypatch.setattr("dbx_migrate_ip_acls.acl.workspace_pas_attached", lambda a, w: False)
     monkeypatch.setattr("dbx_migrate_ip_acls.acl.account_registered_endpoint_count", lambda a: 0)
     monkeypatch.setattr("dbx_migrate_ip_acls.acl.assigned_ingress_state", lambda a, w: ("p1", "dry_run"))
-    promoted = {"n": 0}
-    monkeypatch.setattr(
-        "dbx_migrate_ip_acls.acl.promote_dry_run_to_enforced",
-        lambda *a, **k: promoted.__setitem__("n", promoted["n"] + 1),
-    )
     with pytest.raises(typer.Exit) as e:
-        cli._acl_preflight(object(), 42, will_assign=True, yes=True)  # --yes -> no prompt/promotion
-    assert e.value.exit_code == 0 and promoted["n"] == 0
+        cli._acl_preflight(object(), 42, will_assign=True, yes=True)
+    assert e.value.exit_code == 1
+    out = _squash(capsys.readouterr().out).lower()
+    assert "dry-run" in out and "aborting" in out
 
 
-def test_acl_preflight_dry_run_promotes_when_confirmed(monkeypatch):
-    import typer
-
+def test_acl_preflight_dry_run_warns_and_proceeds_when_not_assigning(monkeypatch, capsys):
+    # not assigning -> existing dry-run policy stays put; warn and continue (no abort).
     monkeypatch.setattr("dbx_migrate_ip_acls.acl.workspace_pas_attached", lambda a, w: False)
     monkeypatch.setattr("dbx_migrate_ip_acls.acl.account_registered_endpoint_count", lambda a: 0)
     monkeypatch.setattr("dbx_migrate_ip_acls.acl.assigned_ingress_state", lambda a, w: ("p1", "dry_run"))
-    promoted = {"n": 0}
-    monkeypatch.setattr(
-        "dbx_migrate_ip_acls.acl.promote_dry_run_to_enforced",
-        lambda *a, **k: promoted.__setitem__("n", promoted["n"] + 1),
-    )
-    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
-    monkeypatch.setattr("typer.confirm", lambda *a, **k: True)
-    with pytest.raises(typer.Exit) as e:
-        cli._acl_preflight(object(), 42, will_assign=True, yes=False)
-    assert e.value.exit_code == 0 and promoted["n"] == 1  # promoted, then migration cancelled
+    cli._acl_preflight(object(), 42, will_assign=False, yes=True)  # must not raise
+    assert "isn't assigning" in capsys.readouterr().out
 
 
 def test_acl_preflight_passes_when_clean(monkeypatch):

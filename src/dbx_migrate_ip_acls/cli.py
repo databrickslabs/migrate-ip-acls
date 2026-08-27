@@ -439,14 +439,12 @@ def _acl_preflight(account, workspace_id, will_assign: bool, yes: bool, is_azure
       Both PrivateLink checks are skipped on Azure, which has neither a PAS nor account VPC
       endpoints — an Azure workspace only needs its IP access lists migrated.
     * An existing assigned CBI ingress policy only matters when this run will **assign** the new
-      policy (assigning would replace the existing one). When assigning:
-        - enforced existing policy -> abort (migrating on top of it isn't supported yet);
-        - dry-run existing policy   -> flag, offer to promote it to enforced, then stop (a migration
-          needs an enforced baseline first).
+      policy (assigning would replace the existing one). When assigning, an assigned policy that has
+      restrictive ingress rules — enforced OR dry-run — aborts: migrating on top of an existing CBI
+      ingress policy isn't supported yet. (A dry-run policy used to offer promotion to enforced then
+      a re-run, but that was a dead end — the re-run just hit this same abort.)
       When NOT assigning (propose-only, --export, or --no-auto-assign) the workspace's binding is
       untouched, so we just warn and let the run create/export the (unbound) policy."""
-    import sys
-
     from . import acl as acl_core
 
     if is_azure:
@@ -454,9 +452,8 @@ def _acl_preflight(account, workspace_id, will_assign: bool, yes: bool, is_azure
         # PrivateLink pre-check applies — skip both and migrate the IP access lists only.
         console.banner(
             "info",
-            "Azure workspace detected — Azure has no Private Access Settings or VPC-endpoint "
-            "(PrivateLink) concept, so those pre-checks are skipped; only the IP access lists are "
-            "migrated.",
+            "Azure workspace detected — Azure has no Private Access Settings so these pre-checks "
+            "are skipped; only the IP access lists are migrated.",
         )
     else:
         pas = acl_core.workspace_pas_attached(account, workspace_id)
@@ -508,38 +505,16 @@ def _acl_preflight(account, workspace_id, will_assign: bool, yes: bool, is_azure
         )
         return
 
-    if state == "enforced":
-        console.banner(
-            "danger",
-            f"This workspace already has an ENFORCED CBI ingress policy "
-            f"('{assigned_id}'). Migrating on top of an existing enforced policy "
-            "is NOT supported yet - aborting.",
-        )
-        raise typer.Exit(code=1)
-
-    # dry-run only, and we're about to assign a replacement
+    # An assigned policy with restrictive ingress rules — enforced OR dry-run — can't be migrated on
+    # top of yet, so abort in both cases. (Promoting a dry-run to enforced and telling the user to
+    # re-run was a dead end: the re-run would just hit this same abort.)
+    kind = "an ENFORCED" if state == "enforced" else "a DRY-RUN"
     console.banner(
-        "warn",
-        f"This workspace has a DRY-RUN CBI ingress policy ('{assigned_id}') with "
-        "no enforced ingress. A migration needs an enforced baseline first.",
+        "danger",
+        f"This workspace already has {kind} CBI ingress policy ('{assigned_id}') with ingress "
+        "rules. Migrating on top of an existing CBI ingress policy is NOT supported yet - aborting.",
     )
-    if (
-        not yes
-        and sys.stdin.isatty()
-        and typer.confirm(
-            typer.style(f"Promote '{assigned_id}' from dry-run to enforced now?", fg="yellow"), default=False
-        )
-    ):
-        with console.status("Promoting policy to enforced…"):
-            acl_core.promote_dry_run_to_enforced(
-                account, assigned_id, note=lambda m: console.banner("info", m)
-            )
-        console.banner(
-            "info",
-            "Promoted to enforced. Re-run the migration to continue now that an " "enforced baseline exists.",
-        )
-    console.banner("info", "Migration cancelled.")
-    raise typer.Exit(code=0)
+    raise typer.Exit(code=1)
 
 
 def _confirm_overwrite(dest, yes: bool) -> bool:
