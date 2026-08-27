@@ -1,7 +1,7 @@
 # 🔁 Databricks Migrate IP ACLs
 
-[![CI](https://github.com/andyweaves/databricks-migrate-ip-acls/actions/workflows/ci.yml/badge.svg)](https://github.com/andyweaves/databricks-migrate-ip-acls/actions/workflows/ci.yml)
-[![codecov](https://codecov.io/gh/andyweaves/databricks-migrate-ip-acls/branch/main/graph/badge.svg)](https://codecov.io/gh/andyweaves/databricks-migrate-ip-acls)
+[![CI](https://github.com/databrickslabs/migrate-ip-acls/actions/workflows/ci.yml/badge.svg)](https://github.com/databrickslabs/migrate-ip-acls/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/databrickslabs/migrate-ip-acls/branch/main/graph/badge.svg)](https://codecov.io/gh/databrickslabs/migrate-ip-acls)
 
 Recreate a Databricks workspace's **existing IP access list** as a **context-based ingress (CBI) policy** via a single, focused CLI: **`dbx-migrate-ip-acls`**.
 > 💡 Looking for traffic-analysis-based ingress/egress policy generation? Those live in the sibling tool - 
@@ -253,4 +253,4 @@ Releases are **fully automated** — there is no manual upload step:
 
 The `release.yml` workflow then builds the sdist + wheel and publishes to **PyPI via Trusted
 Publishing (OIDC)** — no stored token. One-time PyPI setup is required (Project → Publishing):
-owner `andyweaves`, repo `databricks-migrate-ip-acls`, workflow `release.yml`, environment `pypi`.
+owner `databrickslabs`, repo `migrate-ip-acls`, workflow `release.yml`, environment `pypi`.

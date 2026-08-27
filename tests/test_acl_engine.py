@@ -207,7 +207,7 @@ def test_cloud_from_host_maps_all_three_clouds():
     assert acl_core.cloud_from_host("https://adb-123.4.azuredatabricks.net") == "azure"
     assert acl_core.cloud_from_host("https://x.gcp.databricks.com") == "gcp"
     assert acl_core.cloud_from_host("https://dbc-abc.cloud.databricks.com") == "aws"
-    assert acl_core.cloud_from_host("https://sfe-csp.cloud.databricks.com") == "aws"
+    assert acl_core.cloud_from_host("https://acme-prod.cloud.databricks.com") == "aws"
     # vanity / custom workspace subdomains still map by their base domain
     assert acl_core.cloud_from_host("https://acme.cloud.databricks.com") == "aws"
     assert acl_core.cloud_from_host("https://acme.gcp.databricks.com") == "gcp"
@@ -219,19 +219,19 @@ def test_cloud_from_host_maps_all_three_clouds():
 def test_account_host_from_workspace_host():
     f = acl_core.account_host_from_workspace_host
     # AWS prod / staging / vanity: replace the workspace's first label with 'accounts'
-    assert f("https://dbc-8d247fe0-6d2c.cloud.databricks.com") == "https://accounts.cloud.databricks.com"
+    assert f("https://dbc-11112222-3333.cloud.databricks.com") == "https://accounts.cloud.databricks.com"
     assert (
-        f("https://dbc-8d247fe0-6d2c.staging.cloud.databricks.com/")
+        f("https://dbc-11112222-3333.staging.cloud.databricks.com/")
         == "https://accounts.staging.cloud.databricks.com"
     )
     assert f("https://acme.cloud.databricks.com") == "https://accounts.cloud.databricks.com"
     # GCP: workspace hosts have TWO workspace-specific labels (<workspace-id>.<shard>) that the
     # account console drops entirely — anchor on the shared base domain, don't strip one label.
     assert (
-        f("https://1828143886076914.4.staging.gcp.databricks.com")
+        f("https://1111111111111111.4.staging.gcp.databricks.com")
         == "https://accounts.staging.gcp.databricks.com"
     )
-    assert f("https://3062834477717148.8.gcp.databricks.com") == "https://accounts.gcp.databricks.com"
+    assert f("https://2222222222222222.8.gcp.databricks.com") == "https://accounts.gcp.databricks.com"
     assert f("https://1234.gcp.databricks.com") == "https://accounts.gcp.databricks.com"
     # Custom/vanity workspace subdomains (e.g. acme.<base>) resolve to the shared account console:
     # AWS drops the single vanity label; GCP anchors on the base domain (handles the vanity label too).
