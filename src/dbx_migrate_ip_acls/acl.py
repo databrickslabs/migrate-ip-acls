@@ -110,10 +110,18 @@ def cloud_from_host(host: str | None) -> str | None:
 
 def account_host_from_workspace_host(host: str | None) -> str | None:
     """Derive the account-console API host from a workspace host, so a workspace in a non-default
-    environment (e.g. AWS staging) reaches the matching account API instead of the AWS prod default.
-    Azure uses its fixed account host; AWS (prod / staging / vanity) and GCP replace the workspace's
-    own first DNS label with 'accounts' — e.g. dbc-x.staging.cloud.databricks.com ->
-    accounts.staging.cloud.databricks.com. None if it can't be derived from the host."""
+    environment (e.g. AWS staging, GCP) reaches the matching account API instead of the AWS prod
+    default. None if it can't be derived from the host.
+
+    Per cloud:
+    * Azure — one fixed account host (accounts.azuredatabricks.net).
+    * AWS — the workspace host is `<deployment>.[staging.]cloud.databricks.com`; the single leading
+      label is workspace-specific, so replace it with 'accounts' —
+      dbc-x.staging.cloud.databricks.com -> accounts.staging.cloud.databricks.com.
+    * GCP — the workspace host is `<workspace-id>.<shard>.[staging.]gcp.databricks.com` with *two*
+      workspace-specific leading labels (id + shard), which the account console drops entirely —
+      1828…914.4.staging.gcp.databricks.com -> accounts.staging.gcp.databricks.com. So anchor on the
+      shared base domain rather than stripping a fixed number of labels."""
     h = (host or "").strip().lower()
     h = h.split("://", 1)[-1]  # drop any scheme
     h = h.split("/", 1)[0]  # drop any path / trailing slash
@@ -121,9 +129,14 @@ def account_host_from_workspace_host(host: str | None) -> str | None:
         return None
     if "azuredatabricks.net" in h:
         return "https://accounts.azuredatabricks.net"
-    if "cloud.databricks.com" in h or "gcp.databricks.com" in h:
-        # The first label is workspace-specific (dbc-<id> or a vanity name); everything after it is
-        # the environment domain shared with the account console.
+    if "gcp.databricks.com" in h:
+        # Both leading labels (workspace id + shard) are workspace-specific; keep only the shared
+        # environment base (with 'staging' when present).
+        base = "staging.gcp.databricks.com" if ".staging.gcp.databricks.com" in h else "gcp.databricks.com"
+        return f"https://accounts.{base}"
+    if "cloud.databricks.com" in h:
+        # AWS: the first label is workspace-specific (dbc-<id> or a vanity name); everything after it
+        # is the environment domain shared with the account console.
         _first, _, rest = h.partition(".")
         if rest:
             return f"https://accounts.{rest}"
