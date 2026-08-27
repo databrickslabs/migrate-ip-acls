@@ -318,6 +318,76 @@ def test_verify_account_access_offers_reauth_then_retries(monkeypatch):
     assert calls["n"] == 1  # original client tried exactly once before re-auth
 
 
+def test_looks_like_account_console_detects_all_account_hosts():
+    f = cli._looks_like_account_console
+    assert f("https://accounts.cloud.databricks.com") is True
+    assert f("https://accounts.staging.cloud.databricks.com") is True
+    assert f("https://accounts.azuredatabricks.net") is True
+    assert f("https://accounts.gcp.databricks.com") is True
+    # workspace hosts are not account consoles
+    assert f("https://adb-7405612016848327.7.azuredatabricks.net") is False
+    assert f("https://dbc-8d247fe0-6d2c.cloud.databricks.com") is False
+    assert f("https://1234.gcp.databricks.com") is False
+    assert f("") is False
+    assert f(None) is False
+
+
+def _fake_wc(host, ws_id=42, raise_id=False):
+    cfg = type("Cfg", (), {"host": host})()
+
+    class _WC:
+        config = cfg
+
+        def get_workspace_id(self):
+            if raise_id:
+                raise ValueError("Expecting value: line 1 column 1 (char 0)")
+            return ws_id
+
+    return _WC()
+
+
+def test_confirm_workspace_rejects_account_console_profile(monkeypatch, capsys):
+    import typer
+
+    from dbx_migrate_ip_acls.config import Connection
+
+    # an account profile passed as the workspace --profile must fail fast (before the Y/N gate),
+    # not blow up later inside get_workspace_id.
+    monkeypatch.setattr(
+        cli, "_workspace_client_or_exit", lambda conn: _fake_wc("https://accounts.azuredatabricks.net")
+    )
+    with pytest.raises(typer.Exit) as exc:
+        cli._confirm_workspace(Connection(profile="az-cli-test-account"), yes=True)
+    assert exc.value.exit_code == 1
+    out = _squash(capsys.readouterr().out)
+    assert "accountconsole" in out.lower()
+    assert "--account-profile" in out
+
+
+def test_workspace_id_or_exit_returns_id_on_success():
+    assert cli._workspace_id_or_exit(_fake_wc("https://adb-1.7.azuredatabricks.net", ws_id=7)) == 7
+
+
+def test_workspace_id_or_exit_account_host_gives_account_profile_hint(capsys):
+    import typer
+
+    with pytest.raises(typer.Exit) as exc:
+        cli._workspace_id_or_exit(_fake_wc("https://accounts.azuredatabricks.net", raise_id=True))
+    assert exc.value.exit_code == 1
+    out = _squash(capsys.readouterr().out)
+    assert "--account-profile" in out
+
+
+def test_workspace_id_or_exit_other_failure_gives_generic_hint(capsys):
+    import typer
+
+    with pytest.raises(typer.Exit) as exc:
+        cli._workspace_id_or_exit(_fake_wc("https://adb-1.7.azuredatabricks.net", raise_id=True))
+    assert exc.value.exit_code == 1
+    out = _squash(capsys.readouterr().out).lower()
+    assert "workspaceid" in out  # "Couldn't read the workspace id ..." (whitespace squashed)
+
+
 def test_disable_without_create_is_rejected():
     # --disable-existing-ip-acls without a create+assign must fail up front (before any SDK call),
     # so the workspace can't be left unprotected. (create-policy defaults on, so force it off here.)

@@ -325,6 +325,54 @@ def _verify_account_access_or_exit(conn: Connection, account, workspace_id):
             _account_access_error(e, conn)
 
 
+def _looks_like_account_console(host: str | None) -> bool:
+    """True if this host is a Databricks *account* console (accounts.cloud.databricks.com,
+    accounts.staging.cloud.databricks.com, accounts.azuredatabricks.net, accounts.gcp.databricks.com)
+    rather than a workspace. Used to catch an --account-profile mistakenly passed as the workspace
+    --profile before we call workspace-only APIs (e.g. /scim/v2/Me) on it — those return non-JSON on
+    an account host and would otherwise blow up as a raw JSONDecodeError."""
+    if not host:
+        return False
+    from urllib.parse import urlparse
+
+    netloc = urlparse(host if "://" in host else f"https://{host}").netloc.lower()
+    return netloc.startswith("accounts.")
+
+
+def _account_profile_as_workspace_error(host: str) -> None:
+    """Clean, actionable exit when the workspace --profile resolves to an account console host.
+    Always raises."""
+    console.banner(
+        "danger",
+        f"The workspace profile resolves to a Databricks account console ({host}), not a workspace "
+        "— it looks like an account profile was passed as --profile.\n"
+        "  Pass a WORKSPACE profile as --profile (its host is an adb-* / dbc-* workspace URL), and "
+        "put the account profile in --account-profile.",
+    )
+    raise typer.Exit(code=1)
+
+
+def _workspace_id_or_exit(wc) -> int:
+    """Resolve the workspace id, turning an SDK failure into a clean, actionable message instead of a
+    raw traceback. The common cause is a profile that points at an account console (workspace-only
+    APIs like /scim/v2/Me return non-JSON there → JSONDecodeError)."""
+    try:
+        return wc.get_workspace_id()
+    except Exception as e:  # noqa: BLE001 - any failure becomes a clean exit
+        try:
+            host = (wc.config.host or "").rstrip("/")
+        except Exception:  # noqa: BLE001
+            host = ""
+        if _looks_like_account_console(host):
+            _account_profile_as_workspace_error(host)
+        console.banner(
+            "danger",
+            f"Couldn't read the workspace id from {host or 'the workspace'} ({type(e).__name__}). "
+            "Check that --profile points at a reachable Databricks workspace.",
+        )
+        raise typer.Exit(code=1) from None
+
+
 def _confirm_workspace(conn: Connection, yes: bool):
     """Resolve the workspace client and surface exactly which workspace this run reads from and (on
     apply) modifies — profile, URL, id — then gate on Y/N so the target can't be mistaken. Always
@@ -337,6 +385,10 @@ def _confirm_workspace(conn: Connection, yes: bool):
         host = (wc.config.host or "").rstrip("/") or "unknown"
     except Exception:  # noqa: BLE001 - display best-effort; real auth errors surface later in use
         host = "unknown"
+    # A profile pointing at an account console can't be migrated (it's not a workspace) and would
+    # otherwise fail deep inside get_workspace_id with a raw JSONDecodeError — catch it up front.
+    if _looks_like_account_console(host):
+        _account_profile_as_workspace_error(host)
     try:
         ws_id = wc.get_workspace_id()
     except Exception:  # noqa: BLE001
@@ -898,7 +950,7 @@ def _run_acl(cfg: AclConfig, conn: Connection, yes: bool) -> None:
     # table or prompting about disabled lists. That way an unsupported workspace (PrivateLink) or an
     # existing enforced CBI policy fails fast, instead of after the user has scrolled the ACL table,
     # picked disabled rules, and entered an account_id.
-    ws_id = wc.get_workspace_id()
+    ws_id = _workspace_id_or_exit(wc)
     _ensure_account_id(conn, "Migrating an IP ACL (checks PrivateLink + the existing assigned policy)")
     account = _account_client_or_exit(conn)
     # Probe the account API once so a bad account credential (wrong account, wrong Azure AD tenant,
