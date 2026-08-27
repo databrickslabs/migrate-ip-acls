@@ -1,9 +1,11 @@
 """Best-effort Terraform (HCL) rendering for a proposed AccountNetworkPolicy.
 
 `--export` writes the proposed policy as JSON (a curl / REST body) and, alongside it, a Terraform
-config. The Databricks provider's resource/attribute names for account network policies are newer and
-may differ by provider version, so the HCL is a *starting point to review* — not guaranteed to
-`terraform apply` unchanged.
+config. The `databricks_account_network_policy` resource models every nested element as a typed
+**attribute** (a nested object / list of objects), not a repeated block — so the HCL uses attribute
+assignment throughout: `egress = { ... }` and `allowed_internet_destinations = [ { ... } ]`, not
+`egress { ... }`. The attribute names still track a newer provider schema, so the HCL remains a
+*starting point to review*, but it validates + applies against current provider versions.
 """
 
 from __future__ import annotations
@@ -31,21 +33,26 @@ def _scalar(v) -> str:
 
 
 def _lines(obj: dict, indent: int) -> list[str]:
+    """Render a dict's key/values as HCL attribute assignments. The provider's network-policy schema
+    is all nested attributes (objects / lists of objects), so nested structures are assigned with
+    `=`: a dict becomes `key = { ... }` and a list of dicts becomes `key = [ { ... }, { ... } ]`."""
     pad = "  " * indent
     out: list[str] = []
     for key, val in obj.items():
         if val is None or (isinstance(val, (list, dict)) and not val):
             continue  # omit nulls and empties
         if isinstance(val, dict):
-            out.append(f"{pad}{key} {{")
+            out.append(f"{pad}{key} = {{")
             out += _lines(val, indent + 1)
             out.append(f"{pad}}}")
         elif isinstance(val, list) and all(isinstance(i, dict) for i in val):
-            # list of objects -> a repeated nested block per item (the Terraform idiom)
-            for item in val:
-                out.append(f"{pad}{key} {{")
-                out += _lines(item, indent + 1)
-                out.append(f"{pad}}}")
+            # list of objects -> an attribute assigned a list literal of object literals
+            out.append(f"{pad}{key} = [")
+            for i, item in enumerate(val):
+                out.append(f"{pad}  {{")
+                out += _lines(item, indent + 2)
+                out.append(f"{pad}  }}" + ("," if i < len(val) - 1 else ""))
+            out.append(f"{pad}]")
         elif isinstance(val, list):
             out.append(f"{pad}{key} = [{', '.join(_scalar(i) for i in val)}]")
         else:
