@@ -119,7 +119,7 @@ def test_policy_name_per_workspace_trims_long_prefix():
 
 
 def test_policy_name_current_workspace_uses_profile_suffix():
-    assert policy.policy_name("np-helper", suffix="sfe-plain") == "np-helper-sfe-plain"
+    assert policy.policy_name("np-helper", suffix="prod") == "np-helper-prod"
 
 
 def test_policy_name_suffix_is_slugified():

@@ -242,24 +242,24 @@ def test_norm_host_strips_scheme_and_slash():
 
 
 _CONFIG = {
-    "az-cli-test-ws": {"host": "https://adb-74056.7.azuredatabricks.net", "account_id": "5a8ac58d"},
-    "az-cli-test-account": {"host": "https://accounts.azuredatabricks.net", "account_id": "5a8ac58d"},
-    "cli-test-account": {"host": "https://accounts.staging.cloud.databricks.com", "account_id": "ab1e6a24"},
-    "acct-dupe": {"host": "accounts.azuredatabricks.net", "account_id": "5a8ac58d"},  # no-scheme host
+    "az-cli-test-ws": {"host": "https://adb-11111.7.azuredatabricks.net", "account_id": "aaaaaaaa"},
+    "az-cli-test-account": {"host": "https://accounts.azuredatabricks.net", "account_id": "aaaaaaaa"},
+    "cli-test-account": {"host": "https://accounts.staging.cloud.databricks.com", "account_id": "bbbbbbbb"},
+    "acct-dupe": {"host": "accounts.azuredatabricks.net", "account_id": "aaaaaaaa"},  # no-scheme host
 }
 
 
 def test_matching_account_profiles_matches_on_host_and_id(monkeypatch):
     monkeypatch.setattr(cli, "_read_config_profiles", lambda: _CONFIG)
     # exact host + id -> the account profile (and the no-scheme dupe), NOT the workspace profile
-    m = cli._matching_account_profiles("https://accounts.azuredatabricks.net", "5a8ac58d")
+    m = cli._matching_account_profiles("https://accounts.azuredatabricks.net", "aaaaaaaa")
     assert set(m) == {"az-cli-test-account", "acct-dupe"}
     # right id but wrong host (staging vs azure) -> no match: id alone is ambiguous
-    assert cli._matching_account_profiles("https://accounts.azuredatabricks.net", "ab1e6a24") == []
+    assert cli._matching_account_profiles("https://accounts.azuredatabricks.net", "bbbbbbbb") == []
     # right host but wrong id -> no match
-    assert cli._matching_account_profiles("https://accounts.staging.cloud.databricks.com", "5a8ac58d") == []
+    assert cli._matching_account_profiles("https://accounts.staging.cloud.databricks.com", "aaaaaaaa") == []
     # empty inputs -> no match
-    assert cli._matching_account_profiles("", "5a8ac58d") == []
+    assert cli._matching_account_profiles("", "aaaaaaaa") == []
     assert cli._matching_account_profiles("https://accounts.azuredatabricks.net", "") == []
 
 
@@ -270,10 +270,10 @@ def test_resolve_account_profile_sets_single_match(monkeypatch, capsys):
         cli,
         "_read_config_profiles",
         lambda: {
-            "az-cli-test-account": {"host": "https://accounts.azuredatabricks.net", "account_id": "5a8ac58d"},
+            "az-cli-test-account": {"host": "https://accounts.azuredatabricks.net", "account_id": "aaaaaaaa"},
         },
     )
-    conn = Connection(account_host="https://accounts.azuredatabricks.net", account_id="5a8ac58d")
+    conn = Connection(account_host="https://accounts.azuredatabricks.net", account_id="aaaaaaaa")
     cli._resolve_account_profile(conn)
     assert conn.account_profile == "az-cli-test-account"
     assert "az-cli-test-account" in _squash(capsys.readouterr().out)
@@ -285,7 +285,7 @@ def test_resolve_account_profile_noop_when_explicit(monkeypatch):
     # explicit --account-profile must always win, even if the config would match something else
     monkeypatch.setattr(cli, "_read_config_profiles", lambda: _CONFIG)
     conn = Connection(
-        account_host="https://accounts.azuredatabricks.net", account_id="5a8ac58d", account_profile="chosen"
+        account_host="https://accounts.azuredatabricks.net", account_id="aaaaaaaa", account_profile="chosen"
     )
     cli._resolve_account_profile(conn)
     assert conn.account_profile == "chosen"
@@ -304,7 +304,7 @@ def test_resolve_account_profile_multiple_uses_first(monkeypatch, capsys):
     from dbx_migrate_ip_acls.config import Connection
 
     monkeypatch.setattr(cli, "_read_config_profiles", lambda: _CONFIG)
-    conn = Connection(account_host="accounts.azuredatabricks.net", account_id="5a8ac58d")
+    conn = Connection(account_host="accounts.azuredatabricks.net", account_id="aaaaaaaa")
     cli._resolve_account_profile(conn)
     assert conn.account_profile in {"az-cli-test-account", "acct-dupe"}
     assert "multiple" in _squash(capsys.readouterr().out).lower()
@@ -313,11 +313,11 @@ def test_resolve_account_profile_multiple_uses_first(monkeypatch, capsys):
 def test_default_account_id_from_workspace_fills_when_empty(capsys):
     from dbx_migrate_ip_acls.config import Connection
 
-    wc = type("WC", (), {"config": type("C", (), {"account_id": "5a8ac58d"})()})()
+    wc = type("WC", (), {"config": type("C", (), {"account_id": "aaaaaaaa"})()})()
     conn = Connection(account_id="")
     cli._default_account_id_from_workspace(conn, wc)
-    assert conn.account_id == "5a8ac58d"
-    assert "5a8ac58d" in _squash(capsys.readouterr().out)
+    assert conn.account_id == "aaaaaaaa"
+    assert "aaaaaaaa" in _squash(capsys.readouterr().out)
 
 
 def test_default_account_id_from_workspace_respects_explicit():
@@ -430,8 +430,8 @@ def test_looks_like_account_console_detects_all_account_hosts():
     assert f("https://accounts.azuredatabricks.net") is True
     assert f("https://accounts.gcp.databricks.com") is True
     # workspace hosts are not account consoles
-    assert f("https://adb-7405612016848327.7.azuredatabricks.net") is False
-    assert f("https://dbc-8d247fe0-6d2c.cloud.databricks.com") is False
+    assert f("https://adb-1111111111111111.7.azuredatabricks.net") is False
+    assert f("https://dbc-11112222-3333.cloud.databricks.com") is False
     assert f("https://1234.gcp.databricks.com") is False
     assert f("") is False
     assert f(None) is False
@@ -582,15 +582,15 @@ def test_confirm_workspace_bad_profile_exits_cleanly(monkeypatch, capsys):
         auth,
         "workspace_client",
         lambda conn: (_ for _ in ()).throw(
-            ValueError("resolve: /Users/x/.databrickscfg has no sfe-cloud profile configured")
+            ValueError("resolve: /Users/x/.databrickscfg has no ws-typo profile configured")
         ),
     )
-    monkeypatch.setattr(cli, "_available_profiles", lambda: ["sfe-foghorn", "e2-dogfood"])
+    monkeypatch.setattr(cli, "_available_profiles", lambda: ["ws-prod", "e2-dogfood"])
     with pytest.raises(typer.Exit) as exc:
-        cli._confirm_workspace(Connection(profile="sfe-cloud"), yes=True)
+        cli._confirm_workspace(Connection(profile="ws-typo"), yes=True)
     assert exc.value.exit_code == 1
     out = capsys.readouterr().out
-    assert "sfe-cloud" in out and "sfe-foghorn" in out  # names the bad profile + lists available
+    assert "ws-typo" in out and "ws-prod" in out  # names the bad profile + lists available
 
 
 def test_account_client_bad_profile_exits_cleanly(monkeypatch, capsys):
@@ -1162,17 +1162,17 @@ def test_reauth_profile_parsed_from_error_message():
     # the SDK error names the exact profile to re-auth; prefer it over the assumed one.
     assert cli._reauth_profile(_EXPIRED, "assumed") == "p"
     acct = (
-        "... To reauthenticate, run:\n  $ databricks auth login --profile sfe-account. "
+        "... To reauthenticate, run:\n  $ databricks auth login --profile acct-prod. "
         "Config: host=https://accounts.cloud.databricks.com"
     )
-    assert cli._reauth_profile(acct, "sfe-foghorn") == "sfe-account"  # not the assumed workspace one
+    assert cli._reauth_profile(acct, "ws-prod") == "acct-prod"  # not the assumed workspace one
     # no profile named -> fall back to what we asked for
     assert cli._reauth_profile("some unrelated error", "fallback") == "fallback"
 
 
 def test_expired_reauths_profile_named_in_error_not_assumed(monkeypatch):
-    # The real bug: account access resolves to a *different* auto-discovered profile (sfe-account)
-    # than --profile (sfe-foghorn). Re-auth must target the profile the SDK error names.
+    # The real bug: account access resolves to a *different* auto-discovered profile (acct-prod)
+    # than --profile (ws-prod). Re-auth must target the profile the SDK error names.
     import subprocess
 
     import dbx_migrate_ip_acls.auth as auth
@@ -1181,7 +1181,7 @@ def test_expired_reauths_profile_named_in_error_not_assumed(monkeypatch):
     acct_expired = (
         "default auth: databricks-cli: cannot get access token: the refresh token is "
         "invalid. To reauthenticate, run:\n  $ databricks auth login --profile "
-        "sfe-account. Config: host=https://accounts.cloud.databricks.com"
+        "acct-prod. Config: host=https://accounts.cloud.databricks.com"
     )
     calls = {"n": 0}
     sentinel = object()
@@ -1203,10 +1203,10 @@ def test_expired_reauths_profile_named_in_error_not_assumed(monkeypatch):
         return type("R", (), {"returncode": 0})()
 
     monkeypatch.setattr(subprocess, "run", _run)
-    # workspace profile is sfe-foghorn, but the account error names sfe-account -> re-auth that one
-    acc = cli._account_client_or_exit(Connection(profile="sfe-foghorn"))
+    # workspace profile is ws-prod, but the account error names acct-prod -> re-auth that one
+    acc = cli._account_client_or_exit(Connection(profile="ws-prod"))
     assert acc is sentinel
-    assert ran["argv"] == ["databricks", "auth", "login", "--profile", "sfe-account"]
+    assert ran["argv"] == ["databricks", "auth", "login", "--profile", "acct-prod"]
 
 
 # --- --export overwrite guard ------------------------------------------------------------------

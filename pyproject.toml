@@ -21,8 +21,8 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/andyweaves/databricks-migrate-ip-acls"
-Repository = "https://github.com/andyweaves/databricks-migrate-ip-acls"
+Homepage = "https://github.com/databrickslabs/migrate-ip-acls"
+Repository = "https://github.com/databrickslabs/migrate-ip-acls"
 
 [project.scripts]
 dbx-migrate-ip-acls = "dbx_migrate_ip_acls.cli:app"
