@@ -233,6 +233,111 @@ def test_maybe_disable_ip_acls_warns_on_sdk_failure(capsys):
     assert "manually" in out.lower()
 
 
+def test_norm_host_strips_scheme_and_slash():
+    assert cli._norm_host("https://accounts.azuredatabricks.net/") == "accounts.azuredatabricks.net"
+    assert cli._norm_host("accounts.azuredatabricks.net") == "accounts.azuredatabricks.net"
+    assert cli._norm_host("https://ACCOUNTS.CLOUD.databricks.com") == "accounts.cloud.databricks.com"
+    assert cli._norm_host("") == ""
+    assert cli._norm_host(None) == ""
+
+
+_CONFIG = {
+    "az-cli-test-ws": {"host": "https://adb-74056.7.azuredatabricks.net", "account_id": "5a8ac58d"},
+    "az-cli-test-account": {"host": "https://accounts.azuredatabricks.net", "account_id": "5a8ac58d"},
+    "cli-test-account": {"host": "https://accounts.staging.cloud.databricks.com", "account_id": "ab1e6a24"},
+    "acct-dupe": {"host": "accounts.azuredatabricks.net", "account_id": "5a8ac58d"},  # no-scheme host
+}
+
+
+def test_matching_account_profiles_matches_on_host_and_id(monkeypatch):
+    monkeypatch.setattr(cli, "_read_config_profiles", lambda: _CONFIG)
+    # exact host + id -> the account profile (and the no-scheme dupe), NOT the workspace profile
+    m = cli._matching_account_profiles("https://accounts.azuredatabricks.net", "5a8ac58d")
+    assert set(m) == {"az-cli-test-account", "acct-dupe"}
+    # right id but wrong host (staging vs azure) -> no match: id alone is ambiguous
+    assert cli._matching_account_profiles("https://accounts.azuredatabricks.net", "ab1e6a24") == []
+    # right host but wrong id -> no match
+    assert cli._matching_account_profiles("https://accounts.staging.cloud.databricks.com", "5a8ac58d") == []
+    # empty inputs -> no match
+    assert cli._matching_account_profiles("", "5a8ac58d") == []
+    assert cli._matching_account_profiles("https://accounts.azuredatabricks.net", "") == []
+
+
+def test_resolve_account_profile_sets_single_match(monkeypatch, capsys):
+    from dbx_migrate_ip_acls.config import Connection
+
+    monkeypatch.setattr(
+        cli,
+        "_read_config_profiles",
+        lambda: {
+            "az-cli-test-account": {"host": "https://accounts.azuredatabricks.net", "account_id": "5a8ac58d"},
+        },
+    )
+    conn = Connection(account_host="https://accounts.azuredatabricks.net", account_id="5a8ac58d")
+    cli._resolve_account_profile(conn)
+    assert conn.account_profile == "az-cli-test-account"
+    assert "az-cli-test-account" in _squash(capsys.readouterr().out)
+
+
+def test_resolve_account_profile_noop_when_explicit(monkeypatch):
+    from dbx_migrate_ip_acls.config import Connection
+
+    # explicit --account-profile must always win, even if the config would match something else
+    monkeypatch.setattr(cli, "_read_config_profiles", lambda: _CONFIG)
+    conn = Connection(
+        account_host="https://accounts.azuredatabricks.net", account_id="5a8ac58d", account_profile="chosen"
+    )
+    cli._resolve_account_profile(conn)
+    assert conn.account_profile == "chosen"
+
+
+def test_resolve_account_profile_noop_when_no_match(monkeypatch):
+    from dbx_migrate_ip_acls.config import Connection
+
+    monkeypatch.setattr(cli, "_read_config_profiles", lambda: _CONFIG)
+    conn = Connection(account_host="https://accounts.gcp.databricks.com", account_id="nope")
+    cli._resolve_account_profile(conn)
+    assert conn.account_profile is None  # falls through to the access probe
+
+
+def test_resolve_account_profile_multiple_uses_first(monkeypatch, capsys):
+    from dbx_migrate_ip_acls.config import Connection
+
+    monkeypatch.setattr(cli, "_read_config_profiles", lambda: _CONFIG)
+    conn = Connection(account_host="accounts.azuredatabricks.net", account_id="5a8ac58d")
+    cli._resolve_account_profile(conn)
+    assert conn.account_profile in {"az-cli-test-account", "acct-dupe"}
+    assert "multiple" in _squash(capsys.readouterr().out).lower()
+
+
+def test_default_account_id_from_workspace_fills_when_empty(capsys):
+    from dbx_migrate_ip_acls.config import Connection
+
+    wc = type("WC", (), {"config": type("C", (), {"account_id": "5a8ac58d"})()})()
+    conn = Connection(account_id="")
+    cli._default_account_id_from_workspace(conn, wc)
+    assert conn.account_id == "5a8ac58d"
+    assert "5a8ac58d" in _squash(capsys.readouterr().out)
+
+
+def test_default_account_id_from_workspace_respects_explicit():
+    from dbx_migrate_ip_acls.config import Connection
+
+    wc = type("WC", (), {"config": type("C", (), {"account_id": "from-ws"})()})()
+    conn = Connection(account_id="explicit")
+    cli._default_account_id_from_workspace(conn, wc)
+    assert conn.account_id == "explicit"  # a passed --account-id is not overwritten
+
+
+def test_default_account_id_from_workspace_noop_when_workspace_has_none():
+    from dbx_migrate_ip_acls.config import Connection
+
+    wc = type("WC", (), {"config": type("C", (), {"account_id": None})()})()
+    conn = Connection(account_id="")
+    cli._default_account_id_from_workspace(conn, wc)
+    assert conn.account_id == ""
+
+
 def test_verify_account_access_returns_account_and_ws_on_success():
     from dbx_migrate_ip_acls.config import Connection
 

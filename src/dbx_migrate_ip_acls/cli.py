@@ -35,22 +35,32 @@ class Mode(str, Enum):
     enforce = "enforce"  # noqa: E702
 
 
-def _available_profiles() -> list[str]:
-    """Profile names configured in ~/.databrickscfg (or $DATABRICKS_CONFIG_FILE)."""
+def _read_config_profiles() -> dict[str, dict[str, str]]:
+    """Every profile in ~/.databrickscfg (or $DATABRICKS_CONFIG_FILE) as {name: {key: value}},
+    including the DEFAULT section. Empty on a missing file or any read error."""
     import configparser
     import os
 
     path = os.path.expanduser(os.environ.get("DATABRICKS_CONFIG_FILE") or "~/.databrickscfg")
     if not os.path.exists(path):
-        return []
+        return {}
     cp = configparser.ConfigParser()
     try:
         cp.read(path)
     except configparser.Error:
-        return []
+        return {}
+    out = {name: dict(cp[name]) for name in cp.sections()}
     # DEFAULT is a real, selectable profile in .databrickscfg; ConfigParser hides it in sections().
-    names = list(cp.sections())
     if cp.defaults():
+        out["DEFAULT"] = dict(cp.defaults())
+    return out
+
+
+def _available_profiles() -> list[str]:
+    """Profile names configured in ~/.databrickscfg (or $DATABRICKS_CONFIG_FILE), DEFAULT first."""
+    profiles = _read_config_profiles()
+    names = [n for n in profiles if n != "DEFAULT"]
+    if "DEFAULT" in profiles:
         names = ["DEFAULT", *names]
     return names
 
@@ -120,6 +130,73 @@ def _resolve_account_host(conn: Connection, wc) -> None:
             "Pass --account-host to override.",
         )
         conn.account_host = derived
+
+
+def _norm_host(host: str | None) -> str:
+    """Bare, comparable host: scheme + trailing slash stripped, lower-cased. So 'https://X/' and 'X'
+    compare equal when matching a config profile's host against the account host."""
+    if not host:
+        return ""
+    from urllib.parse import urlparse
+
+    return urlparse(host if "://" in host else f"https://{host}").netloc.lower().rstrip("/")
+
+
+def _matching_account_profiles(account_host: str, account_id: str) -> list[str]:
+    """Profiles in the Databricks config whose host is `account_host` AND whose account_id is
+    `account_id`. Matching on BOTH is deliberate: an account_id alone is ambiguous — the same id
+    appears under several profiles, and the same id can exist across environments — so pairing it
+    with the account-console host disambiguates."""
+    if not account_host or not account_id:
+        return []
+    target = _norm_host(account_host)
+    return [
+        name
+        for name, cfg in _read_config_profiles().items()
+        if _norm_host(cfg.get("host")) == target and (cfg.get("account_id") or "") == account_id
+    ]
+
+
+def _default_account_id_from_workspace(conn: Connection, wc) -> None:
+    """When --account-id wasn't given, default it from the workspace profile's own account_id (a
+    workspace .databrickscfg profile usually carries it), so the user needn't retype it — and can't
+    fat-finger a different account's id. Mutates conn."""
+    if conn.account_id:
+        return
+    ws_account_id = getattr(getattr(wc, "config", None), "account_id", None)
+    if ws_account_id:
+        conn.account_id = str(ws_account_id)
+        console.banner(
+            "info",
+            f"Using account id '{conn.account_id}' from the workspace profile. Pass --account-id to "
+            "override.",
+        )
+
+
+def _resolve_account_profile(conn: Connection) -> None:
+    """When no --account-profile was given, find a config profile matching the account host +
+    account_id and use it, so account calls authenticate as that account admin rather than whatever
+    ambient credential unified auth would otherwise resolve (a frequent source of wrong-tenant /
+    wrong-account failures). Mutates conn. No-op when --account-profile was passed or nothing
+    matches; on multiple matches it uses the first and says so."""
+    if conn.account_profile:
+        return
+    matches = _matching_account_profiles(conn.account_host, conn.account_id)
+    if not matches:
+        return  # nothing matched → fall through; the account-access probe explains any failure
+    if len(matches) > 1:
+        console.banner(
+            "info",
+            f"Multiple config profiles match account '{conn.account_id}' at {conn.account_host} "
+            f"({', '.join(matches)}); using '{matches[0]}'. Pass --account-profile to choose.",
+        )
+    else:
+        console.banner(
+            "info",
+            f"Using account profile '{matches[0]}', matched to account '{conn.account_id}' at "
+            f"{conn.account_host}. Pass --account-profile to override.",
+        )
+    conn.account_profile = matches[0]
 
 
 def _ensure_account_id(conn: Connection, reason: str) -> None:
@@ -281,9 +358,10 @@ def _account_access_error(e: Exception, conn: Connection) -> None:
         creds = f"the --account-profile '{conn.account_profile}' credentials"
     else:
         creds = (
-            "the account credentials resolved by unified auth — no --account-profile was given, so "
-            "they came from $DATABRICKS_* / an auto-discovered profile / a cached cloud login, which "
-            "may be for a different tenant or account"
+            "the account credentials resolved by unified auth — no --account-profile was given and no "
+            "profile in your Databricks config matches this account's host + id, so they came from "
+            "$DATABRICKS_* / an auto-discovered profile / a cached cloud login, which may be for a "
+            "different tenant or account"
         )
     detail = " ".join(str(e).split())[:300] or type(e).__name__
     console.banner(
@@ -926,7 +1004,13 @@ def _run_acl(cfg: AclConfig, conn: Connection, yes: bool) -> None:
     # existing enforced CBI policy fails fast, instead of after the user has scrolled the ACL table,
     # picked disabled rules, and entered an account_id.
     ws_id = _workspace_id_or_exit(wc)
+    # Default the account_id from the workspace profile (so it needn't be retyped / mis-typed), then
+    # prompt only if still unknown.
+    _default_account_id_from_workspace(conn, wc)
     _ensure_account_id(conn, "Migrating an IP ACL (checks PrivateLink + the existing assigned policy)")
+    # With the account host + id known, auto-pick a matching account-admin profile from the config so
+    # account calls don't fall back to an ambient (often wrong-tenant / wrong-account) credential.
+    _resolve_account_profile(conn)
     account = _account_client_or_exit(conn)
     # Probe the account API once so a bad account credential (wrong account, wrong Azure AD tenant,
     # or not account-admin) fails fast with a clear message here — rather than being silently

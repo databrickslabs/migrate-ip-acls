@@ -179,8 +179,8 @@ flowchart TD
 | `--auto-assign` / `--no-auto-assign` | Bind the current workspace to the new policy (default **on**). |
 | `--create-policy` / `--no-create-policy` | Master write switch. **On by default** (a review gate still confirms). For a propose-only run: `--no-create-policy --no-auto-assign`. |
 | `--disable-existing-ip-acls` | After create **and** assign, turn off the workspace's IP access lists. Requires create + assign **and** `--policy-mode enforce`. Off by default. |
-| `--account-id` (+ account-admin creds) | **Always required** — pre-checks and create/assign are account-level. |
-| `--account-host`, `--account-profile` | Account API host (when unset, **derived from the workspace's environment** — AWS staging / GCP / Azure — falling back to the AWS prod console) / a dedicated profile for account-level calls. |
+| `--account-id` (+ account-admin creds) | Account-level (pre-checks and create/assign). When unset it **defaults to the workspace profile's own `account_id`**, else prompts. |
+| `--account-host`, `--account-profile` | Account API host (when unset, **derived from the workspace's environment** — AWS staging / GCP / Azure — falling back to the AWS prod console) / a dedicated profile for account-level calls. When `--account-profile` is unset, the CLI **auto-selects a config profile whose host + account_id match** the target account, so account calls don't fall back to an ambient credential. |
 | `--yes`, `-y` | Non-interactive: skip the step-through pauses and the review/write gate. `--yes` **will** create + assign. |
 
 **Invalid flag combinations** (rejected up front — before the profile prompt or any account call, so
@@ -195,6 +195,13 @@ APIs, and create/assign write them. Pass `--account-id <numeric id>` with **acco
 credentials resolvable by unified auth for the account host (an account-admin service principal via
 OAuth M2M is the recommended path). A workspace-only OAuth session **cannot** call the account API —
 use `--account-profile` (or env) for account creds if your workspace profile can't.
+
+`--account-id` isn't usually typed: it **defaults to the workspace profile's `account_id`** when set.
+Likewise, if you don't pass `--account-profile`, the CLI looks in your Databricks config for a profile
+whose **host and `account_id` both match** the target account and uses it automatically (matching on
+both, since an `account_id` alone is ambiguous across profiles and environments). If exactly one
+matches it's used; none → it falls back to unified auth (and the account-access check fails fast with
+a clear message if that credential is wrong); several → it uses the first and tells you.
 
 The **account host** is chosen to match the workspace's environment: unless you pass `--account-host`,
 it's derived from the workspace host (e.g. an AWS *staging* workspace →
