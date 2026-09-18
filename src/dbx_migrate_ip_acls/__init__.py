@@ -8,4 +8,11 @@ Extracted from databricks-network-policy-helper (which retains the traffic-analy
 `egress` commands).
 """
 
-__version__ = "0.1.0"
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _version
+
+try:
+    # Set at build/install time by hatch-vcs from the git tag (see pyproject.toml).
+    __version__ = _version("databricks-migrate-ip-acls")
+except PackageNotFoundError:  # running from a source tree that was never installed
+    __version__ = "0.0.0+unknown"
