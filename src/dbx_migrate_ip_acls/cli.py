@@ -867,8 +867,23 @@ def _ensure_acl_policy_name_unique(cfg: AclConfig, account, workspace_id, yes: b
         cfg.policy_name = entered
 
 
+def _version_callback(value: bool) -> None:
+    if value:
+        from . import __version__
+
+        typer.echo(f"dbx-migrate-ip-acls {__version__}")
+        raise typer.Exit()
+
+
 @app.callback(invoke_without_command=True)
 def migrate(
+    version: bool = typer.Option(
+        None,
+        "--version",
+        callback=_version_callback,
+        is_eager=True,
+        help="Show the version and exit.",
+    ),
     profile: str | None = typer.Option(None, help="Databricks CLI/config profile."),
     policy_mode: Mode = typer.Option(Mode.enforce, help="enforce (default) or dry_run."),
     policy_name: str = typer.Option(

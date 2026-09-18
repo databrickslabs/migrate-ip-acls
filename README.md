@@ -246,11 +246,23 @@ and PR across Python 3.10–3.12, and uploads coverage to Codecov (the badge abo
 
 ## 📦 Releasing
 
-Releases are **fully automated** — there is no manual upload step:
+The version is **derived from the git tag** by [`hatch-vcs`](https://github.com/ofek/hatch-vcs) —
+there is no version string to bump. Check `dbx-migrate-ip-acls --version` at any time; between tags
+the build reports a PEP 440 dev version like `0.1.1.dev3+g<sha>`, and on a tagged commit the clean
+number.
 
-1. Bump `version` in `pyproject.toml`.
-2. Tag and push: `git tag vX.Y.Z && git push origin vX.Y.Z`.
+Releases are **fully automated** — there is no manual upload step. Record the highlights in
+[`CHANGELOG.md`](CHANGELOG.md), then tag `main` and push the tag:
+
+```bash
+git tag -a vX.Y.Z -m "dbx-migrate-ip-acls X.Y.Z"
+git push origin vX.Y.Z
+```
 
 The `release.yml` workflow then builds the sdist + wheel and publishes to **PyPI via Trusted
 Publishing (OIDC)** — no stored token. One-time PyPI setup is required (Project → Publishing):
 owner `databrickslabs`, repo `migrate-ip-acls`, workflow `release.yml`, environment `pypi`.
+**Pushing a `v*` tag publishes to PyPI — it is irreversible**, so tag deliberately.
+
+The full step-by-step checklist — post-merge tagging, verifying the build first, and publishing a
+GitHub Release — is in [`docs/releasing.md`](docs/releasing.md).
