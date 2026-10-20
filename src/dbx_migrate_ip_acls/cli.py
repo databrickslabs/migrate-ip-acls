@@ -505,17 +505,21 @@ def _resolve_policy_name(cfg, conn: Connection, wc, yes: bool) -> None:
     cfg.policy_name = entered or default
 
 
-def _acl_preflight(account, workspace_id, will_assign: bool, yes: bool, is_azure: bool = False) -> None:
-    """Account-level pre-checks (run before any migration).
+def _acl_preflight(account, workspace_id, will_assign: bool, yes: bool, cloud: str | None = None, ws=None):
+    """Account-level pre-checks (run before any migration). Returns the front-end PrivateLink posture
+    to fold into the migration: `(public_access_enabled, private_plan)` — `private_plan` is None when
+    there's no PrivateLink to migrate.
 
-    * This workspace has a PAS (PrivateLink) attached -> always abort (unsupported for now; the
-      produced policy would be incomplete).
-    * The ACCOUNT has any registered VPC (PrivateLink) endpoints -> abort, even if this workspace
-      isn't attached to one (CBI private access defaults to allow-all endpoints, so migrating now
-      could change the effective access posture if PAS is later retired; blocked until CBI private
-      access is GA).
-      Both PrivateLink checks are skipped on Azure, which has neither a PAS nor account VPC
-      endpoints — an Azure workspace only needs its IP access lists migrated.
+    Per cloud (front-end PrivateLink source of truth):
+    * AWS — read the workspace's Private Access Settings (PAS). If attached, migrate it as-is into the
+      new policy's private_access block (its public toggle + endpoint scope). No PAS → public only.
+    * GCP — front-end PrivateLink is Private Service Connect (PSC), also surfaced as a PAS. Migrating
+      a PSC-protected GCP workspace to CBI isn't supported yet → abort. (Same code path as AWS so GCP
+      can slot in as a fast-follow.)
+    * Azure — the public-network-access toggle and front-end private endpoints live in Azure Resource
+      Manager, not the Databricks account API, so they can't be read/migrated here. Migrate the IP
+      access lists only and tell the user to configure any Azure PrivateLink manually (fast-follow).
+
     * An existing assigned CBI ingress policy only matters when this run will **assign** the new
       policy (assigning would replace the existing one). When assigning, an assigned policy that has
       restrictive ingress rules — enforced OR dry-run — aborts: migrating on top of an existing CBI
@@ -525,52 +529,53 @@ def _acl_preflight(account, workspace_id, will_assign: bool, yes: bool, is_azure
       untouched, so we just warn and let the run create/export the (unbound) policy."""
     from . import acl as acl_core
 
-    if is_azure:
-        # Azure has no Private Access Settings and no VPC (PrivateLink) endpoints, so neither
-        # PrivateLink pre-check applies — skip both and migrate the IP access lists only.
+    public_access_enabled, private_plan = True, None
+
+    if cloud == "azure":
         console.banner(
             "info",
-            "Azure workspace detected — Azure has no Private Access Settings so these pre-checks "
-            "are skipped; only the IP access lists are migrated.",
+            "Azure workspace detected — Azure front-end Private Link (the public-network-access "
+            "toggle and private endpoints) isn't readable via the Databricks account API, so it is "
+            "NOT migrated. Only the IP access lists are migrated; configure any Azure Private Link "
+            "ingress on the new policy manually. (Azure PrivateLink migration is a planned "
+            "fast-follow.)",
         )
     else:
-        pas = acl_core.workspace_pas_attached(account, workspace_id)
-        if pas is True:
-            console.banner(
-                "danger",
-                "This workspace has a Private Access Settings (PAS) object attached "
-                "(PrivateLink). Migrating a PAS/PrivateLink workspace to CBI is NOT "
-                "supported yet - aborting.",
-            )
-            raise typer.Exit(code=1)
-        if pas is None:
+        pas, status = acl_core.read_workspace_pas(account, workspace_id, ws=ws)
+        if status == "error":
             console.banner(
                 "warn",
-                "Couldn't verify whether a PAS/PrivateLink is attached (account read "
-                "failed). If this workspace uses PrivateLink, migration is NOT "
-                "supported yet.",
+                "Couldn't read this workspace's Private Access Settings (account read failed). If it "
+                "uses front-end PrivateLink, that part is NOT migrated — verify the generated "
+                "policy's private access before relying on it.",
             )
-
-        endpoints = acl_core.account_registered_endpoint_count(account)
-        if endpoints:
+        elif status == "ok":
+            if cloud == "gcp":
+                # GCP front-end PrivateLink is Private Service Connect (PSC). Not supported yet.
+                console.banner(
+                    "danger",
+                    "This GCP workspace is protected by Private Service Connect (PSC). Migrating a "
+                    "PSC-protected GCP workspace to CBI is NOT supported yet - aborting. (GCP support "
+                    "is a planned fast-follow.)",
+                )
+                raise typer.Exit(code=1)
+            public_access_enabled, private_plan = acl_core.plan_from_pas(pas)
             console.banner(
-                "danger",
-                f"This account has {endpoints} registered VPC (PrivateLink) "
-                "endpoint(s). Migrating a workspace in a PrivateLink account to CBI "
-                "is NOT supported yet - aborting.",
+                "info",
+                "Front-end PrivateLink detected — it will be recreated as-is in the new policy's "
+                "private access rules.",
             )
-            raise typer.Exit(code=1)
-        if endpoints is None:
-            console.banner(
-                "warn",
-                "Couldn't verify the account's registered VPC endpoints (account "
-                "read failed). If this account uses PrivateLink, migration is NOT "
-                "supported yet.",
-            )
+            if not public_access_enabled:
+                console.banner(
+                    "info",
+                    "Public network access is disabled on this workspace (PrivateLink-only) — the "
+                    "generated policy denies all public ingress.",
+                )
+        # status == "none": no PAS attached — no front-end PrivateLink to migrate (public only).
 
     assigned_id, state = acl_core.assigned_ingress_state(account, workspace_id)
     if state is None:
-        return
+        return public_access_enabled, private_plan
 
     if not will_assign:
         kind = "an ENFORCED" if state == "enforced" else "a DRY-RUN"
@@ -581,7 +586,7 @@ def _acl_preflight(account, workspace_id, will_assign: bool, yes: bool, is_azure
             "one stays in place — the new policy will be created/exported but not "
             "bound to the workspace.",
         )
-        return
+        return public_access_enabled, private_plan
 
     # An assigned policy with restrictive ingress rules — enforced OR dry-run — can't be migrated on
     # top of yet, so abort in both cases. (Promoting a dry-run to enforced and telling the user to
@@ -772,16 +777,39 @@ def _acl_ip_gate(analysis, wc, yes: bool, create_policy: bool = True) -> None:
         skips the offer and just previews from the individually-enabled lists;
       * enabled  + 0 rules  → nothing to migrate (exit);
       * enabled  + 1+ rules → show the current config, then proceed.
-    A read failure on the toggle (None) just warns and proceeds. All exits are clean (code 0)."""
+    A read failure on the toggle (None) just warns and proceeds. All exits are clean (code 0).
+
+    Front-end PrivateLink shifts this: when the workspace has public access disabled
+    (PrivateLink-only) the IP access lists aren't in effect, so the public quadrant is skipped
+    entirely — the current lists are shown for context and the run proceeds to migrate the private
+    access. And whenever there's a private_plan to migrate, a 0-rule IP ACL config is no longer
+    "nothing to migrate" — the run proceeds on the private access alone."""
     import sys
 
     from . import acl as acl_core
 
     toggle = acl_core.ip_acl_enforcement_state(wc)
     total = len(analysis.ip_acls) + len(analysis.disabled_acls)
+    has_private = getattr(analysis, "private_plan", None) is not None
+
+    if not getattr(analysis, "public_access_enabled", True):
+        # PrivateLink-only workspace: public internet access is off, so the IP access lists aren't
+        # evaluated and the public block becomes a deny-all. There's no public quadrant to resolve —
+        # show the current lists for context (if any) and proceed to migrate the private access.
+        if total:
+            render.acl_current_config(analysis, workspace_enabled=bool(toggle))
+        console.banner(
+            "info",
+            "Public network access is disabled on this workspace (PrivateLink-only) — the IP access "
+            "lists are not in effect and are not migrated as public rules; migrating the front-end "
+            "PrivateLink (private access) only.",
+        )
+        return
 
     if toggle is False:
         if total == 0:
+            if has_private:
+                return  # no public IP ACLs, but there's front-end PrivateLink to migrate
             console.banner(
                 "info",
                 "This workspace's IP access lists are disabled and have no rules. "
@@ -808,6 +836,13 @@ def _acl_ip_gate(analysis, wc, yes: bool, create_policy: bool = True) -> None:
             "to migrate.",
         )
         if yes or not sys.stdin.isatty():
+            if has_private:
+                console.banner(
+                    "info",
+                    "The IP access lists are disabled (not re-enabled non-interactively), so only "
+                    "the front-end PrivateLink (private access) is migrated.",
+                )
+                return
             console.banner(
                 "info",
                 "Re-run interactively to enable them, or set "
@@ -824,11 +859,20 @@ def _acl_ip_gate(analysis, wc, yes: bool, create_policy: bool = True) -> None:
             acl_core.enable_ip_access_lists(wc, note=lambda m: console.banner("info", m))
             console.banner("info", "Enabled — continuing with the migration of the now-active rules.")
             return  # proceed with the run
+        if has_private:
+            console.banner(
+                "info",
+                "Leaving the IP access lists disabled — migrating the front-end PrivateLink (private "
+                "access) only.",
+            )
+            return
         console.banner("info", "Nothing to migrate — the IP access lists are not active. Aborting.")
         raise typer.Exit(code=0)
 
     # toggle is True or None (unknown).
     if total == 0:
+        if has_private:
+            return  # no public IP ACLs, but there's front-end PrivateLink to migrate
         console.banner(
             "info", "This workspace's IP access lists have no rules. There is nothing to " "migrate."
         )
@@ -1040,10 +1084,11 @@ def _run_acl(cfg: AclConfig, conn: Connection, yes: bool) -> None:
     # anyway — it has no PAS and no back-end network config).
     ws_host = getattr(getattr(wc, "config", None), "host", None)
     cloud = acl_core.workspace_cloud(account, ws_id, host=ws_host, ws=ws_obj)
-    is_azure = cloud == "azure"
-    # An existing assigned policy is only replaced if we're going to assign the new one.
-    _acl_preflight(
-        account, ws_id, will_assign=cfg.create_policy and cfg.auto_assign, yes=yes, is_azure=is_azure
+    # An existing assigned policy is only replaced if we're going to assign the new one. The preflight
+    # also reads the workspace's front-end PrivateLink posture (its public toggle + private_access
+    # plan) so it can be recreated as-is in the new policy.
+    public_access_enabled, private_plan = _acl_preflight(
+        account, ws_id, will_assign=cfg.create_policy and cfg.auto_assign, yes=yes, cloud=cloud, ws=ws_obj
     )
 
     # Copy the egress of the policy the workspace currently runs under (its assigned policy, or the
@@ -1052,12 +1097,20 @@ def _run_acl(cfg: AclConfig, conn: Connection, yes: bool) -> None:
     egress_source, existing_egress = acl_core.assigned_egress(account, ws_id)
 
     # Read the workspace's IP access lists + enforcement state, and decide whether there's anything
-    # to migrate at all (the quadrant gate may exit cleanly).
+    # to migrate at all (the quadrant gate may exit cleanly). Fold in the front-end PrivateLink
+    # posture from the preflight — carried on the analysis so the builders recreate it as-is, and so
+    # the gate doesn't treat a PrivateLink-only workspace (few/no public IP ACLs) as "nothing to
+    # migrate".
     analysis = acl_core.analyze(cfg, wc)
+    analysis.public_access_enabled = public_access_enabled
+    analysis.private_plan = private_plan
     _acl_ip_gate(analysis, wc, yes, cfg.create_policy)
-    # Flag any individually-disabled lists and offer to re-enable + include them (may re-read).
+    # Flag any individually-disabled lists and offer to re-enable + include them (may re-read). A
+    # re-read returns a fresh analysis, so re-apply the account-derived PrivateLink posture.
     analysis = _reconcile_disabled_lists(analysis, cfg, wc, yes)
-    if not (analysis.allow_specs or analysis.deny_specs):
+    analysis.public_access_enabled = public_access_enabled
+    analysis.private_plan = private_plan
+    if not (analysis.allow_specs or analysis.deny_specs or analysis.private_plan is not None):
         console.banner(
             "info",
             "This workspace's IP access lists are all individually disabled — "
@@ -1071,9 +1124,11 @@ def _run_acl(cfg: AclConfig, conn: Connection, yes: bool) -> None:
     _note_policy_name(cfg.policy_name)
     _confirm_params(yes)
 
-    # Show the final IP ACL set that will be migrated (reflecting any re-enables) and confirm, so the
-    # step-through pause has context rather than being a bare "continue?" after the params gate.
-    render.acl_current_config(analysis, workspace_enabled=True)
+    # Show the final IP ACL set that will be migrated (reflecting any re-enables) + any front-end
+    # PrivateLink being recreated, and confirm, so the step-through pause has context rather than
+    # being a bare "continue?" after the params gate.
+    render.acl_current_config(analysis, workspace_enabled=analysis.public_access_enabled)
+    render.acl_private_access(analysis)
     _checkpoint(yes)
 
     preview = acl_core.preview_block(

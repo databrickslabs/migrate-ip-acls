@@ -52,6 +52,45 @@ def test_acl_analyze_labels_have_no_mode_suffix():
     assert label == "office"
 
 
+def test_preview_includes_private_access_block_when_plan_set():
+    ws = _FakeWs([_FakeAcl("office", "ALLOW", True, ["8.8.8.8/32"])])
+    cfg = AclConfig(policy_mode="enforce")
+    a = acl_core.analyze(cfg, ws)
+    a.private_plan = acl_core.PrivateAccessPlan(
+        restriction_mode="RESTRICTED_ACCESS", endpoint_ids=["el-1"], label="corp-pas"
+    )
+    prev = acl_core.preview_block(a, cfg)
+    ingress = prev["ingress"]
+    assert ingress["public_access"]["allow_rules"][0]["label"] == "office"
+    assert ingress["private_access"]["allow_rules"][0]["origin"]["endpoints"]["endpoint_ids"] == ["el-1"]
+
+
+def test_preview_public_disabled_denies_public_keeps_private():
+    ws = _FakeWs([_FakeAcl("office", "ALLOW", True, ["8.8.8.8/32"])])
+    cfg = AclConfig(policy_mode="enforce")
+    a = acl_core.analyze(cfg, ws)
+    a.public_access_enabled = False  # PrivateLink-only
+    a.private_plan = acl_core.PrivateAccessPlan(restriction_mode="ALLOW_ALL_REGISTERED_ENDPOINTS")
+    pub = acl_core.preview_block(a, cfg)["ingress"]["public_access"]
+    assert pub["restriction_mode"] == "RESTRICTED_ACCESS"
+    assert "allow_rules" not in pub  # the IP ACL is not recreated as a public rule
+
+
+def test_apply_sends_private_access_in_created_policy():
+    captured = {}
+    ws = _FakeWs([], ws_id=42)  # PrivateLink-only workspace with no IP access lists
+    cfg = AclConfig(policy_name="pl-only", create_policy=True, auto_assign=False)
+    a = acl_core.analyze(cfg, ws)
+    a.public_access_enabled = False
+    a.private_plan = acl_core.PrivateAccessPlan(
+        restriction_mode="RESTRICTED_ACCESS", endpoint_ids=["el-9"], label="pas"
+    )
+    acl_core.apply(a, cfg, _CreateCapturingAccount(captured), account_id="acc")
+    ingress = captured["policy"].as_dict()["ingress"]
+    assert ingress["private_access"]["allow_rules"][0]["origin"]["endpoints"]["endpoint_ids"] == ["el-9"]
+    assert "allow_rules" not in ingress["public_access"]  # public deny-all
+
+
 def test_acl_analyze_all_disabled_leaves_nothing_to_migrate():
     ws = _FakeWs([_FakeAcl("off", "ALLOW", False, ["1.1.1.1/32"])])
     a = acl_core.analyze(AclConfig(), ws)
@@ -185,12 +224,36 @@ def test_ip_acl_enforcement_state_reads_toggle():
     assert acl_core.ip_acl_enforcement_state(_FakeWs([])) is None
 
 
-def _pas_account(pas_id):
+def _pas_account(pas_id, pas=None, pas_raises=False):
+    """An account client whose workspace carries `pas_id`, and whose private_access.get returns
+    `pas` (or raises when pas_raises)."""
+
     class _WS:
         def get(self, workspace_id):
             return type("W", (), {"private_access_settings_id": pas_id})()
 
-    return type("Acct", (), {"workspaces": _WS()})()
+    class _PA:
+        def get(self, private_access_settings_id):
+            if pas_raises:
+                raise RuntimeError("no perms")
+            return pas
+
+    return type("Acct", (), {"workspaces": _WS(), "private_access": _PA()})()
+
+
+def _pas(level=None, public=True, ids=None, name=None, pas_id="pas-abc"):
+    """A fake PrivateAccessSettings object. `level` is 'ACCOUNT' / 'ENDPOINT' (or None)."""
+    return type(
+        "PAS",
+        (),
+        {
+            "private_access_settings_id": pas_id,
+            "private_access_settings_name": name,
+            "public_access_enabled": public,
+            "private_access_level": type("L", (), {"value": level})() if level else None,
+            "allowed_vpc_endpoint_ids": ids,
+        },
+    )()
 
 
 def _cloud_account(cloud, raise_=False):
@@ -313,36 +376,69 @@ def test_workspace_cloud_reuses_prefetched_ws_without_a_second_call():
     )
 
 
-def test_workspace_pas_attached_true_false():
-    assert acl_core.workspace_pas_attached(_pas_account("pas-abc"), 42) is True
-    assert acl_core.workspace_pas_attached(_pas_account(None), 42) is False
+def test_read_workspace_pas_none_when_no_pas_attached():
+    # no private_access_settings_id on the workspace -> 'none' (genuinely no front-end PrivateLink)
+    pas, status = acl_core.read_workspace_pas(_pas_account(None), 42)
+    assert pas is None and status == "none"
 
 
-def test_workspace_pas_attached_none_on_error():
+def test_read_workspace_pas_ok_returns_object():
+    obj = _pas(level="ACCOUNT")
+    pas, status = acl_core.read_workspace_pas(_pas_account("pas-abc", pas=obj), 42)
+    assert pas is obj and status == "ok"
+
+
+def test_read_workspace_pas_error_on_workspace_read_failure():
     class _WS:
         def get(self, workspace_id):
             raise RuntimeError("no perms")
 
     acct = type("Acct", (), {"workspaces": _WS()})()
-    assert acl_core.workspace_pas_attached(acct, 42) is None
+    pas, status = acl_core.read_workspace_pas(acct, 42)
+    assert pas is None and status == "error"
 
 
-def _endpoint_account(endpoints, raise_=False):
-    class _VE:
-        def list(self):
-            if raise_:
-                raise RuntimeError("no perms")
-            return list(endpoints)
-
-    return type("Acct", (), {"vpc_endpoints": _VE()})()
+def test_read_workspace_pas_error_when_pas_id_present_but_unreadable():
+    # a PAS id is attached but the private_access.get call fails -> 'error', not 'none'
+    pas, status = acl_core.read_workspace_pas(_pas_account("pas-abc", pas_raises=True), 42)
+    assert pas is None and status == "error"
 
 
-def test_account_registered_endpoint_count():
-    # any account-registered VPC endpoint counts, regardless of use case or workspace attachment
-    assert acl_core.account_registered_endpoint_count(_endpoint_account([])) == 0
-    assert acl_core.account_registered_endpoint_count(_endpoint_account(["fe", "be"])) == 2
-    # unreadable (account read failed) -> None (caller warns and proceeds)
-    assert acl_core.account_registered_endpoint_count(_endpoint_account([], raise_=True)) is None
+def test_read_workspace_pas_reuses_prefetched_ws():
+    class _Boom:
+        def get(self, workspace_id):
+            raise AssertionError("must not fetch when ws= is supplied")
+
+    obj = _pas(level="ENDPOINT", ids=["el-1"])
+    private_access = _pas_account("x", pas=obj).private_access
+    acct = type("Acct", (), {"workspaces": _Boom(), "private_access": private_access})()
+    ws = type("W", (), {"private_access_settings_id": "pas-abc"})()
+    pas, status = acl_core.read_workspace_pas(acct, 42, ws=ws)
+    assert pas is obj and status == "ok"
+
+
+def test_plan_from_pas_account_level_allows_all_registered():
+    public, plan = acl_core.plan_from_pas(_pas(level="ACCOUNT", public=True, name="corp-pas"))
+    assert public is True
+    assert plan.restriction_mode == "ALLOW_ALL_REGISTERED_ENDPOINTS"
+    assert plan.endpoint_ids == []
+    assert plan.label == "corp-pas"  # PAS name kept verbatim as the rule label
+    assert plan.source_pas_id == "pas-abc"
+
+
+def test_plan_from_pas_endpoint_level_enumerates_ids_and_reads_public_toggle():
+    public, plan = acl_core.plan_from_pas(
+        _pas(level="ENDPOINT", public=False, ids=["el-1", "el-2"], name=None)
+    )
+    assert public is False  # public access disabled -> PrivateLink-only
+    assert plan.restriction_mode == "RESTRICTED_ACCESS"
+    assert plan.endpoint_ids == ["el-1", "el-2"]
+    assert plan.label == "registered-private-endpoints"  # fallback label when the PAS has no name
+
+
+def test_plan_from_pas_unspecified_level_defaults_to_allow_all():
+    _public, plan = acl_core.plan_from_pas(_pas(level=None))
+    assert plan.restriction_mode == "ALLOW_ALL_REGISTERED_ENDPOINTS"
 
 
 def test_policy_exists_true_false():

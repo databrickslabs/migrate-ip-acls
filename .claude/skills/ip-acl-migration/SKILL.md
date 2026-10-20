@@ -1,6 +1,6 @@
 ---
 name: ip-acl-migration
-description: Migrate a Databricks workspace's existing IP access list (ACL) into a context-based ingress (CBI) account network policy, as-is, using the dbx-migrate-ip-acls CLI. Use when the user wants to convert / migrate an existing IP access list to a network policy, recreate their IP ACL as CBI, or stand up a network policy from the current ACL without audit-log analysis. Runs `dbx-migrate-ip-acls`, which reads this workspace's ACL (ALLOW->allow rules, BLOCK->deny rules) and recreates it verbatim — nothing added — then creates the account network policy (enforce or dry-run) and optionally auto-assigns it to the current workspace.
+description: Migrate a Databricks workspace's existing IP access list (ACL) — and its front-end PrivateLink on AWS — into a context-based ingress (CBI) account network policy, as-is, using the dbx-migrate-ip-acls CLI. Use when the user wants to convert / migrate an existing IP access list to a network policy, recreate their IP ACL as CBI, migrate a front-end PrivateLink / PrivateLink-only workspace, or stand up a network policy from the current ACL without audit-log analysis. Runs `dbx-migrate-ip-acls`, which reads this workspace's ACL (ALLOW->allow rules, BLOCK->deny rules) and, on AWS, its Private Access Settings (PrivateLink), recreates them verbatim — nothing added — then creates the account network policy (enforce or dry-run) and optionally auto-assigns it to the current workspace.
 ---
 
 # IP Access List → CBI migration
@@ -37,6 +37,10 @@ options go straight after the program name.
      (nothing to migrate). `--yes` never auto-flips the toggle — it exits with guidance.
    - **enabled + 0 rules** → "have no rules. Nothing to migrate." → **exit**.
    - **enabled + 1+ rules** → **proceed**. (Unreadable toggle → warn + proceed.)
+
+   The "nothing to migrate" exits **don't** apply when the workspace has front-end PrivateLink to
+   migrate (step 3): a PrivateLink-only workspace with public disabled skips the public quadrant
+   entirely, and a 0-rule IP ACL config still proceeds on the private access alone.
 2. Reads the workspace's IP access lists (`w.ip_access_lists.list()`). **Individual lists that are
    disabled are flagged and NOT migrated** — only enabled lists are; the disabled ones are called out
    in the final printout (below the old + new policy) so you can vet them. Maps **ALLOW lists → allow
@@ -45,16 +49,21 @@ options go straight after the program name.
    the ACL has **only BLOCK lists**, a catch-all allow (all public IPs) is added, because CBI
    RESTRICTED_ACCESS is default-deny — without it a deny-only policy would block everything, flipping
    the ACL's default-allow-except-blocked meaning.
-3. Runs account-level **pre-checks** before migrating. The two PrivateLink checks below are **skipped
-   entirely on Azure** (the cloud is resolved from the account workspaces API `cloud` field, falling
-   back to the workspace host's domain when the API doesn't populate it) — an Azure workspace has
-   neither a Private Access Settings object nor VPC endpoints, so it only needs its IP ACLs migrated:
-   - **PAS attached?** If **this workspace** has a Private Access Settings object (front-end
-     PrivateLink), migration to CBI isn't supported yet — it **aborts**.
-   - **Account has registered VPC endpoints?** If the **account** has ≥1 registered VPC (PrivateLink)
-     endpoint — front-end or back-end, any use case — it **aborts** too, even if *this* workspace
-     isn't attached to one. CBI private access isn't GA yet and defaults to allow-all endpoints, so
-     any PrivateLink account is blocked for now (this limitation lifts once CBI private access GAs).
+3. Runs account-level **pre-checks** before migrating. Front-end PrivateLink is resolved **per cloud**
+   (the cloud is read from the account workspaces API `cloud` field, falling back to the workspace
+   host's domain) from **this workspace's Private Access Settings (PAS)**:
+   - **AWS — PAS attached?** It's **migrated as-is** into the new policy's `private_access` block (see
+     step 2): `private_access_level=ACCOUNT` → `ALLOW_ALL_REGISTERED_ENDPOINTS`; `ENDPOINT` → a
+     `RESTRICTED_ACCESS` private rule listing the PAS's registered endpoint ids. If the PAS has
+     **public access disabled** (PrivateLink-only), the IP access lists aren't recreated as public
+     rules (they aren't in effect) and the `public_access` block becomes an explicit **deny-all**. No
+     PAS → public-only, as before. The PAS and the public toggle are **read, never modified**.
+   - **GCP — PAS attached (PSC)?** Migrating a Private Service Connect-protected GCP workspace to CBI
+     isn't supported yet — it **aborts** (planned fast-follow).
+   - **Azure.** The public-network-access toggle and front-end private endpoints live in Azure
+     Resource Manager, **not** the Databricks account API, so they can't be read/migrated here. The IP
+     access lists are migrated and you're told to configure any Azure PrivateLink manually (planned
+     fast-follow).
    - **Existing *restrictive* CBI ingress policy?** Only matters when the run will **assign** the new
      policy, and only for a policy that **actually restricts traffic** — an allow-all policy such as
      the account's baseline `default-policy` is ignored. When assigning over a restrictive one —
@@ -74,7 +83,7 @@ options go straight after the program name.
 
 > This tool deliberately does **not** auto-allow Databricks' own control-plane IPs or do any
 > enrichment — it assumes the existing ACL is what the customer wants. It migrates the **ingress**
-> (the IP ACLs) and, for **egress**, copies the egress block of the policy the workspace currently
+> (the IP ACLs, plus front-end PrivateLink on AWS) and, for **egress**, copies the egress block of the policy the workspace currently
 > runs under **verbatim** — its enforcement mode, allowed internet (FQDN) + storage destinations, and
 > blocked-internet lists — so egress posture is preserved rather than reset. The source is the
 > workspace's assigned policy, or the account baseline `default-policy` when nothing is assigned; only
