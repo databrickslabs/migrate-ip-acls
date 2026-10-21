@@ -14,6 +14,8 @@ commit `vX.Y.Z` — which the release workflow then publishes to PyPI. See
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-21
+
 ### Added
 
 - **Front-end PrivateLink migration (AWS / GCP).** A workspace with a Private Access Settings (PAS)
@@ -81,5 +83,6 @@ enrichment.
   working in propose-only mode.
 - **`--version`.** `dbx-migrate-ip-acls --version` reports the tool version.
 
-[Unreleased]: https://github.com/databrickslabs/migrate-ip-acls/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/databrickslabs/migrate-ip-acls/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/databrickslabs/migrate-ip-acls/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/databrickslabs/migrate-ip-acls/releases/tag/v0.1.0
