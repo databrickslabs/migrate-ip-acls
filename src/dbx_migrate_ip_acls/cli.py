@@ -506,17 +506,16 @@ def _resolve_policy_name(cfg, conn: Connection, wc, yes: bool) -> None:
 
 
 def _acl_preflight(account, workspace_id, cloud: str | None = None, ws=None):
-    """Read the workspace's front-end PrivateLink posture to fold into the migration, per cloud, and
-    abort early on the one unsupported case (GCP PSC). Returns `(public_access_enabled, private_plan)`
-    — `private_plan` is None when there's no PrivateLink to migrate. The per-dimension conflict check
-    against any existing assigned CBI policy happens later, in `_acl_conflict_gate`.
+    """Read the workspace's front-end PrivateLink posture to fold into the migration, per cloud.
+    Returns `(public_access_enabled, private_plan)` — `private_plan` is None when there's no
+    PrivateLink to migrate. The per-dimension conflict check against any existing assigned CBI policy
+    happens later, in `_acl_conflict_gate`.
 
     Per cloud (front-end PrivateLink source of truth):
-    * AWS — read the workspace's Private Access Settings (PAS). If attached, migrate it as-is into the
-      new policy's private_access block (its public toggle + endpoint scope). No PAS → public only.
-    * GCP — front-end PrivateLink is Private Service Connect (PSC), also surfaced as a PAS. Migrating
-      a PSC-protected GCP workspace to CBI isn't supported yet → abort. (Same code path as AWS so GCP
-      can slot in as a fast-follow.)
+    * AWS / GCP — read the workspace's Private Access Settings (PAS); on GCP front-end PrivateLink is
+      Private Service Connect (PSC), surfaced through the same PAS object. If attached, migrate it
+      as-is into the new policy's private_access block (its public toggle + endpoint scope) — the
+      mapping is cloud-agnostic. No PAS → public only.
     * Azure — there's nothing to migrate: Azure front-end PrivateLink uses Azure Private Endpoints
       (not a PAS), and context-based ingress allows `databricks_ui_api` endpoints by default, so the
       workspace's existing private connectivity keeps working with no private_access rules. The public
@@ -543,15 +542,6 @@ def _acl_preflight(account, workspace_id, cloud: str | None = None, ws=None):
             "policy's private access before relying on it.",
         )
     elif status == "ok":
-        if cloud == "gcp":
-            # GCP front-end PrivateLink is Private Service Connect (PSC). Not supported yet.
-            console.banner(
-                "danger",
-                "This GCP workspace is protected by Private Service Connect (PSC). Migrating a "
-                "PSC-protected GCP workspace to CBI is NOT supported yet - aborting. (GCP support "
-                "is a planned fast-follow.)",
-            )
-            raise typer.Exit(code=1)
         public_access_enabled, private_plan = acl_core.plan_from_pas(pas)
         console.banner(
             "info",

@@ -1041,19 +1041,16 @@ def test_acl_preflight_aws_no_pas_is_public_only(monkeypatch):
     assert cli._acl_preflight(object(), 42, cloud="aws") == (True, None)
 
 
-def test_acl_preflight_aborts_on_gcp_psc(monkeypatch, capsys):
-    # A GCP workspace with a PAS is PSC-protected — still unsupported, so abort.
-    import typer
-
-    _patch_pas(monkeypatch, status="ok")
-    with pytest.raises(typer.Exit) as e:
-        cli._acl_preflight(object(), 42, cloud="gcp")
-    assert e.value.exit_code == 1
-    assert "psc" in capsys.readouterr().out.lower()
+def test_acl_preflight_gcp_pas_is_migrated(monkeypatch, capsys):
+    # GCP PSC is surfaced through the same PAS object, migrated as-is via the cloud-agnostic mapping.
+    plan = _patch_pas(monkeypatch, status="ok", public=True)
+    public_enabled, private_plan = cli._acl_preflight(object(), 42, cloud="gcp")
+    assert public_enabled is True and private_plan is plan
+    assert "front-end privatelink detected" in capsys.readouterr().out.lower()
 
 
 def test_acl_preflight_gcp_no_pas_proceeds(monkeypatch):
-    # A GCP workspace with no PAS has no front-end PSC — migrate the IP access lists (no abort).
+    # A GCP workspace with no PAS has no front-end PSC — migrate the IP access lists only.
     _patch_pas(monkeypatch, status="none")
     assert cli._acl_preflight(object(), 42, cloud="gcp") == (True, None)
 
