@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from . import console
+from . import acl, console
 from .config import AclConfig
 
 
@@ -49,10 +49,15 @@ def acl_current_config(analysis, workspace_enabled: bool = False) -> None:
     state = "ENABLED" if workspace_enabled else "DISABLED"
     console.rule(f"Current IP access list configuration ({state})")
     # A list is migrated only if it's enabled AND produced a rule (has usable IPv4 CIDRs) — i.e. its
-    # label appears in the built allow/deny specs. Disabled lists are never migrated.
-    migrated = {s["label"] for s in getattr(analysis, "allow_specs", [])} | {
-        s["label"] for s in getattr(analysis, "deny_specs", [])
-    }
+    # label appears in the built allow/deny specs. Disabled lists are never migrated. And when public
+    # network access is disabled (PrivateLink-only), the IP access lists aren't in effect at all, so
+    # none of them are migrated as public rules regardless of their individual state.
+    if getattr(analysis, "public_access_enabled", True):
+        migrated = {s["label"] for s in getattr(analysis, "allow_specs", [])} | {
+            s["label"] for s in getattr(analysis, "deny_specs", [])
+        }
+    else:
+        migrated = set()
 
     def _flag(ok: bool) -> str:
         # Colour the cell so the answer clearly stands out (red False / green True). Rich markup
@@ -77,6 +82,45 @@ def acl_disabled_notice(analysis) -> None:
         "warn",
         f"{len(analysis.disabled_acls)} rule(s) are disabled and WILL NOT be migrated: {names}. "
         "Make sure you review these rules carefully before proceeding.",
+    )
+
+
+def acl_private_access(analysis) -> None:
+    """Show what the generated policy's private_access will be — the front-end PrivateLink migrated
+    from the PAS, or the workspace's existing CBI private rules preserved verbatim. Nothing is shown
+    when there's neither."""
+    plan = getattr(analysis, "private_plan", None)
+    existing_private = getattr(analysis, "existing_private", None)
+    if plan is None:
+        if existing_private is not None:
+            console.rule("Private access")
+            console.banner(
+                "info",
+                "The workspace's existing CBI private access rules are preserved verbatim in the new "
+                "policy (this migration doesn't change private access on this workspace). Review them "
+                "in the JSON preview below.",
+            )
+        return
+    console.rule("Front-end PrivateLink → private access")
+    if plan.restriction_mode == "ALLOW_ALL_REGISTERED_ENDPOINTS" and acl.block_restrictive(existing_private):
+        console.banner(
+            "info",
+            "Front-end PrivateLink is account-level (all registered endpoints), but the workspace "
+            "already has stricter CBI private access — the existing restrictive private rules are "
+            "preserved rather than loosened. Review them in the JSON preview below.",
+        )
+        return
+    if plan.restriction_mode == "ALLOW_ALL_REGISTERED_ENDPOINTS":
+        detail = "all registered private endpoints (ALLOW_ALL_REGISTERED_ENDPOINTS)"
+    elif plan.endpoint_ids:
+        detail = f"RESTRICTED_ACCESS — selected endpoints: {', '.join(plan.endpoint_ids)}"
+    else:
+        detail = "RESTRICTED_ACCESS — no registered endpoints permitted"
+    src = f" (from Private Access Settings '{plan.source_pas_id}')" if plan.source_pas_id else ""
+    console.banner(
+        "info",
+        f"Front-end PrivateLink is migrated as-is into the policy's private access: {detail}{src}. "
+        "Review it alongside the JSON preview below.",
     )
 
 

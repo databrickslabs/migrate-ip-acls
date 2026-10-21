@@ -72,6 +72,30 @@ def test_hcl_list_of_objects_is_comma_separated():
     assert hcl.count('destination = "a.com"') == 1 and hcl.count('destination = "b.com"') == 1
 
 
+def test_hcl_renders_private_access_endpoints():
+    policy = {
+        "network_policy_id": "pl",
+        "ingress": {
+            "public_access": {"restriction_mode": "RESTRICTED_ACCESS"},
+            "private_access": {
+                "restriction_mode": "RESTRICTED_ACCESS",
+                "allow_rules": [
+                    {
+                        "label": "corp-pas",
+                        "origin": {"endpoints": {"endpoint_ids": ["el-1", "el-2"]}},
+                        "destination": {"all_destinations": True},
+                    }
+                ],
+            },
+        },
+    }
+    hcl = terraform.network_policy_hcl(policy)
+    assert "private_access = {" in hcl
+    assert "endpoints = {" in hcl
+    assert 'endpoint_ids = ["el-1", "el-2"]' in hcl
+    assert "private_access {" not in hcl  # attribute syntax, not a block
+
+
 def test_hcl_tf_name_falls_back_when_id_not_identifier():
     # a purely-numeric id can't start a TF identifier -> prefixed
     hcl = terraform.network_policy_hcl({"network_policy_id": "123"})

@@ -24,6 +24,23 @@ DEFAULT_POLICY_ID = "default-policy"
 
 
 @dataclass
+class PrivateAccessPlan:
+    """The workspace's front-end PrivateLink, recreated as-is in the CBI `private_access` block.
+
+    Derived from the workspace's Private Access Settings (PAS):
+    * `private_access_level=ACCOUNT`  → restriction_mode ALLOW_ALL_REGISTERED_ENDPOINTS (any
+      registered endpoint; no explicit rules);
+    * `private_access_level=ENDPOINT` → restriction_mode RESTRICTED_ACCESS with one allow rule
+      listing the PAS's `allowed_vpc_endpoint_ids` (the Databricks-registered endpoint ids).
+    The label is the PAS name (verbatim) when it has one, else a generic fallback."""
+
+    restriction_mode: str  # "ALLOW_ALL_REGISTERED_ENDPOINTS" | "RESTRICTED_ACCESS"
+    endpoint_ids: list[str] = field(default_factory=list)
+    label: str = "registered-private-endpoints"
+    source_pas_id: str | None = None
+
+
+@dataclass
 class AclAnalysis:
     workspace_id: int
     ip_acls: list[dict] = field(default_factory=list)  # enabled lists (migrated)
@@ -32,6 +49,22 @@ class AclAnalysis:
     # Individual IP access lists with enabled=false — surfaced to the user but NOT migrated (the tool
     # preserves inbound access exactly as it is, and a disabled list isn't in effect).
     disabled_acls: list[dict] = field(default_factory=list)
+    # Front-end PrivateLink, read from the account (not the workspace client), so these are populated
+    # by the CLI after analyze() rather than by analyze() itself:
+    #   * public_access_enabled — the PAS public-internet toggle (default True = no PAS / public on).
+    #     When False (PrivateLink-only), the generated public_access block is an explicit deny-all.
+    #   * private_plan — the PAS mapped to a CBI private_access block, or None when there's no
+    #     front-end PrivateLink to migrate.
+    public_access_enabled: bool = True
+    private_plan: PrivateAccessPlan | None = None
+    # The workspace's existing assigned CBI policy's ingress sub-blocks (deep-copied), preserved
+    # verbatim in the generated policy for any dimension this migration doesn't itself produce.
+    # Public and private are independent: IP ACLs → public, PAS → private (AWS/GCP), and whatever
+    # isn't migrated is copied from these. Cross-workspace access is never produced, so it's always
+    # carried over. Populated by the CLI after analyze().
+    existing_public: object | None = None
+    existing_private: object | None = None
+    existing_xws: object | None = None
 
 
 def _ipv4(cidrs):
@@ -146,15 +179,15 @@ def account_host_from_workspace_host(host: str | None) -> str | None:
 def verify_account_access(account, workspace_id):
     """Make one real account-API call up front (fetch this workspace via the account API) so a bad
     account credential fails FAST with a clear message. Every other account reader here
-    (`workspace_cloud`, `workspace_pas_attached`, `account_registered_endpoint_count`,
-    `assigned_ingress_state`, `assigned_egress`) is deliberately best-effort — it swallows errors and
+    (`workspace_cloud`, `read_workspace_pas`, `existing_cbi_ingress`, `assigned_egress`) is
+    deliberately best-effort — it swallows errors and
     degrades to a safe-ish default. That's right once we know the account client works, but if it
     *doesn't* (wrong account, wrong Azure AD tenant, missing account-admin rights) those swallows
     would silently produce wrong results — skipped PrivateLink checks, or a FULL_ACCESS egress
     instead of the copied one — and the failure would only surface much later as a raw SDK traceback
     from the first reader that happens not to catch it (`policy_exists`). Probing here converts all
     of that into one clean, early error. Returns the workspace object (callers reuse it for cloud
-    detection); the underlying SDK error propagates on failure."""
+    detection + the PAS read); the underlying SDK error propagates on failure."""
     return account.workspaces.get(workspace_id=int(workspace_id))
 
 
@@ -177,29 +210,55 @@ def workspace_cloud(account, workspace_id, host: str | None = None, ws: object |
     return cloud_from_host(host)
 
 
-def workspace_pas_attached(account, workspace_id) -> bool | None:
-    """True if the workspace has a Private Access Settings (PAS) object attached — i.e. it uses
-    (AWS/GCP) PrivateLink. None if it couldn't be determined (Azure workspaces have no PAS, so this
-    returns False there). Best-effort so a read failure degrades to a warning rather than a crash."""
+def read_workspace_pas(account, workspace_id, ws: object | None = None) -> tuple[object | None, str]:
+    """Fetch the workspace's Private Access Settings (PAS) object — the source of truth for AWS/GCP
+    front-end PrivateLink. Returns (pas, status) where status is:
+      * 'none'  — no PAS attached (the workspace has no front-end PrivateLink; migrate public only);
+      * 'ok'    — PAS read (`pas` is the object to map into a private_access block);
+      * 'error' — the account read failed (caller warns; PrivateLink can't be migrated).
+    Separating 'none' from 'error' matters: a workspace with genuinely no PrivateLink must migrate
+    cleanly, while an unreadable account must warn rather than silently drop a private rule. Pass `ws`
+    to reuse an already-fetched workspace object (e.g. from verify_account_access). Best-effort."""
     try:
-        ws = account.workspaces.get(workspace_id=int(workspace_id))
-        return bool(getattr(ws, "private_access_settings_id", None))
-    except Exception:  # noqa: BLE001 - couldn't determine; caller warns
-        return None
+        if ws is None:
+            ws = account.workspaces.get(workspace_id=int(workspace_id))
+    except Exception:  # noqa: BLE001 - couldn't read the workspace; caller warns
+        return None, "error"
+    pas_id = getattr(ws, "private_access_settings_id", None)
+    if not pas_id:
+        return None, "none"
+    try:
+        return account.private_access.get(private_access_settings_id=pas_id), "ok"
+    except Exception:  # noqa: BLE001 - PAS id present but unreadable; caller warns
+        return None, "error"
 
 
-def account_registered_endpoint_count(account) -> int | None:
-    """How many VPC (PrivateLink) endpoints are registered in the ACCOUNT — any use case: front-end
-    (GENERAL_ACCESS / WORKSPACE_ACCESS) or back-end SCC relay (DATAPLANE_RELAY_ACCESS). Any registered
-    endpoint means the account uses PrivateLink, so migration is blocked until CBI private access is
-    GA — even if THIS workspace isn't attached to one (CBI private access defaults to allow-all
-    endpoints, so migrating now could change the effective access posture if PAS is later retired).
-    0 if none; None if it couldn't be determined. Best-effort so a read failure degrades to a
-    warning rather than a crash."""
-    try:
-        return len(list(account.vpc_endpoints.list()))
-    except Exception:  # noqa: BLE001 - couldn't determine; caller warns
-        return None
+def plan_from_pas(pas) -> tuple[bool, PrivateAccessPlan]:
+    """Map a Private Access Settings object to (public_access_enabled, PrivateAccessPlan), recreating
+    the workspace's front-end PrivateLink as-is. `public_access_enabled` is the PAS public-internet
+    toggle; the plan is the private_access block (ACCOUNT → allow-all-registered, ENDPOINT → the
+    enumerated allowed endpoint ids)."""
+    # A PAS object may carry public_access_enabled=None (field present but unset) — getattr returns
+    # None, so the `True` default never applies. Treat unknown as public-ENABLED (the as-is default):
+    # don't infer "PrivateLink-only / deny-all public" from a missing value.
+    pae = getattr(pas, "public_access_enabled", None)
+    public_enabled = True if pae is None else bool(pae)
+    level = getattr(pas, "private_access_level", None)
+    level_val = str(getattr(level, "value", level) or "").upper()
+    pas_id = getattr(pas, "private_access_settings_id", None)
+    # Keep the PAS name as the rule label verbatim (nothing added); fall back when it has none.
+    label = getattr(pas, "private_access_settings_name", None) or "registered-private-endpoints"
+    if level_val == "ENDPOINT":
+        ids = list(getattr(pas, "allowed_vpc_endpoint_ids", None) or [])
+        plan = PrivateAccessPlan(
+            restriction_mode="RESTRICTED_ACCESS", endpoint_ids=ids, label=label, source_pas_id=pas_id
+        )
+    else:
+        # ACCOUNT (or an unspecified level) means any endpoint registered in the account is accepted.
+        plan = PrivateAccessPlan(
+            restriction_mode="ALLOW_ALL_REGISTERED_ENDPOINTS", label=label, source_pas_id=pas_id
+        )
+    return public_enabled, plan
 
 
 def policy_exists(account, policy_id: str) -> bool:
@@ -223,6 +282,13 @@ def _block_restrictive(blk) -> bool:
     if str(getattr(rm, "value", rm) or "") == "RESTRICTED_ACCESS":
         return True
     return bool(getattr(blk, "allow_rules", None) or getattr(blk, "deny_rules", None))
+
+
+def block_restrictive(block) -> bool:
+    """True if a single ingress sub-block (a public_access or private_access object) restricts
+    traffic. Used to decide, per dimension, whether an existing CBI block collides with what this
+    migration would write (public and private are independent)."""
+    return _block_restrictive(block)
 
 
 def public_restrictive(ingress) -> bool:
@@ -292,20 +358,46 @@ def assigned_policy(account, workspace_id) -> tuple[str | None, object | None]:
         return policy_id, None
 
 
-def assigned_ingress_state(account, workspace_id) -> tuple[str | None, str | None]:
-    """Inspect the network policy currently assigned to the workspace. Returns
-    (assigned_policy_id, ingress_state) where ingress_state is 'enforced' (a *restrictive* enforced
-    ingress block), 'dry_run' (a *restrictive* dry-run ingress block), or None — no policy assigned,
-    or the assigned policy is effectively allow-all (no restrictive rules to preserve, so migrating
-    over it loses nothing). Best-effort."""
+def _active_ingress(pol):
+    """The ingress block that carries a policy's rules — prefer the enforced `ingress`, falling back
+    to `ingress_dry_run` (a policy has a single enforcement mode, so its rules live in one or the
+    other). None if neither is present."""
+    ing = getattr(pol, "ingress", None)
+    if ing is not None and _ingress_restrictive(ing):
+        return ing
+    dry = getattr(pol, "ingress_dry_run", None)
+    if dry is not None and _ingress_restrictive(dry):
+        return dry
+    return ing if ing is not None else dry
+
+
+def existing_cbi_ingress(
+    account, workspace_id
+) -> tuple[str | None, object | None, object | None, object | None]:
+    """The workspace's currently-assigned CBI policy's ingress sub-blocks, deep-copied so they can be
+    preserved verbatim in the generated policy for any dimension this migration doesn't itself
+    produce. Returns (assigned_policy_id, public_access, private_access, cross_workspace_access);
+    (id, None, None, None) when nothing is assigned / unreadable. Public and private ingress are
+    independent — the migration replaces the dimensions it migrates (IP ACLs → public, PAS → private)
+    and copies these blocks for the rest. Best-effort."""
     policy_id, pol = assigned_policy(account, workspace_id)
     if pol is None:
-        return policy_id, None
-    if _ingress_restrictive(getattr(pol, "ingress", None)):
-        return policy_id, "enforced"
-    if _ingress_restrictive(getattr(pol, "ingress_dry_run", None)):
-        return policy_id, "dry_run"
-    return policy_id, None
+        return policy_id, None, None, None
+    ing = _active_ingress(pol)
+    if ing is None:
+        return policy_id, None, None, None
+    # Only carry over *restrictive* sub-blocks — a permissive one (FULL_ACCESS /
+    # ALLOW_ALL_REGISTERED_ENDPOINTS, e.g. the baseline default-policy) is equivalent to omitting it,
+    # so dropping it keeps the generated policy clean and never silently re-adds an allow-all block.
+    pub = getattr(ing, "public_access", None)
+    priv = getattr(ing, "private_access", None)
+    xws = getattr(ing, "cross_workspace_access", None)
+    return (
+        policy_id,
+        copy.deepcopy(pub) if _block_restrictive(pub) else None,
+        copy.deepcopy(priv) if _block_restrictive(priv) else None,
+        copy.deepcopy(xws) if _block_restrictive(xws) else None,
+    )
 
 
 def assigned_egress(account, workspace_id) -> tuple[str | None, object | None]:
@@ -398,9 +490,57 @@ def resolve_policy_id(cfg: AclConfig, workspace_id) -> str:
     return policy.policy_name("", explicit=(cfg.policy_name or str(workspace_id)))
 
 
+def migrating_public(analysis: AclAnalysis) -> bool:
+    """True when there's a legacy public source to migrate into the policy's public_access — enabled
+    IP access lists, or the PAS public toggle being off (public disabled → explicit deny-all). When
+    False, the workspace's existing CBI public_access (if any) is preserved instead."""
+    return bool(analysis.allow_specs or analysis.deny_specs or not analysis.public_access_enabled)
+
+
+def _resolve_private_block(analysis: AclAnalysis, note: Note):
+    """The generated policy's private_access: migrate from the PAS (AWS/GCP) when present, otherwise
+    preserve the workspace's existing CBI private_access verbatim. One exception (per guidance): an
+    account-level (allow-all) PAS must NOT loosen an existing *restrictive* CBI private policy — the
+    stricter existing rules win."""
+    plan = analysis.private_plan
+    existing = analysis.existing_private
+    if plan is not None:
+        if plan.restriction_mode == "ALLOW_ALL_REGISTERED_ENDPOINTS" and block_restrictive(existing):
+            note(
+                "Front-end PrivateLink is account-level (all registered endpoints), but the workspace "
+                "already has restrictive CBI private access — preserving the stricter existing private "
+                "rules rather than loosening them to allow-all."
+            )
+            return existing
+        return policy.build_private_access_block(plan.restriction_mode, plan.endpoint_ids, plan.label)
+    if existing is not None:
+        note(
+            "Preserving the workspace's existing CBI private access rules (no front-end PrivateLink "
+            "to migrate)."
+        )
+    return existing
+
+
 def build_block(analysis: AclAnalysis, cfg: AclConfig, note: Note = lambda _m: None):
-    # mode_label=None → rule labels are migrated verbatim (no "(enforced)"/"(dry-run)" suffix).
-    return policy.build_ingress_block(analysis.allow_specs, analysis.deny_specs, None, note)
+    # Public and private ingress are independent. Each dimension is either MIGRATED from a legacy
+    # source or PRESERVED from the workspace's existing CBI policy; cross-workspace access is never
+    # produced here, so it's always carried over. mode_label=None → rule labels are verbatim.
+    if migrating_public(analysis):
+        public = policy.build_public_access_block(
+            analysis.allow_specs,
+            analysis.deny_specs,
+            None,
+            note,
+            public_enabled=analysis.public_access_enabled,
+        )
+    else:
+        public = analysis.existing_public
+        if public is not None:
+            note(
+                "Preserving the workspace's existing CBI public access rules (no IP access lists to migrate)."
+            )
+    private = _resolve_private_block(analysis, note)
+    return policy.assemble_ingress(public, private, analysis.existing_xws)
 
 
 def build_account_policy(

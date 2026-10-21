@@ -100,6 +100,75 @@ def test_full_access_egress():
     assert egr["network_access"]["restriction_mode"] == "FULL_ACCESS"
 
 
+# --------------------------------------------------------------------- private access (front-end PL)
+def test_private_access_allow_all_registered():
+    blk = policy.build_private_access_block("ALLOW_ALL_REGISTERED_ENDPOINTS", [], "lbl").as_dict()
+    assert blk["restriction_mode"] == "ALLOW_ALL_REGISTERED_ENDPOINTS"
+    assert "allow_rules" not in blk  # no explicit rules for allow-all
+
+
+def test_private_access_restricted_enumerates_endpoint_ids():
+    blk = policy.build_private_access_block("RESTRICTED_ACCESS", ["el-1", "el-2"], "corp-pas").as_dict()
+    assert blk["restriction_mode"] == "RESTRICTED_ACCESS"
+    rule = blk["allow_rules"][0]
+    assert rule["label"] == "corp-pas"
+    assert rule["origin"]["endpoints"]["endpoint_ids"] == ["el-1", "el-2"]
+    assert rule["destination"]["all_destinations"] is True
+
+
+def test_private_access_restricted_without_ids_has_no_allow_rules():
+    # an endpoint-scoped PAS that allows nothing -> RESTRICTED_ACCESS with no allow rules (deny-all).
+    blk = policy.build_private_access_block("RESTRICTED_ACCESS", [], "lbl").as_dict()
+    assert blk["restriction_mode"] == "RESTRICTED_ACCESS"
+    assert "allow_rules" not in blk
+
+
+class _Plan:
+    def __init__(self, restriction_mode, endpoint_ids=None, label="pl"):
+        self.restriction_mode = restriction_mode
+        self.endpoint_ids = endpoint_ids or []
+        self.label = label
+
+
+def test_ingress_block_includes_private_access_when_plan_given():
+    block = policy.build_ingress_block(
+        [_allow()], [], None, private_plan=_Plan("ALLOW_ALL_REGISTERED_ENDPOINTS")
+    ).as_dict()
+    assert block["public_access"]["allow_rules"]  # public still built
+    assert block["private_access"]["restriction_mode"] == "ALLOW_ALL_REGISTERED_ENDPOINTS"
+
+
+def test_ingress_block_public_disabled_is_deny_all_and_drops_ip_acls():
+    notes = []
+    block = policy.build_ingress_block(
+        [_allow()],
+        [{"label": "d", "cidrs": ["9.9.9.0/24"]}],
+        None,
+        note=notes.append,
+        public_enabled=False,
+        private_plan=_Plan("RESTRICTED_ACCESS", ["el-1"]),
+    ).as_dict()
+    pub = block["public_access"]
+    assert pub["restriction_mode"] == "RESTRICTED_ACCESS"
+    assert "allow_rules" not in pub and "deny_rules" not in pub  # IP ACLs not recreated as public
+    assert any("disabled" in n for n in notes)
+    assert block["private_access"]["allow_rules"][0]["origin"]["endpoints"]["endpoint_ids"] == ["el-1"]
+
+
+def test_ingress_block_public_disabled_no_ip_acls_emits_no_note():
+    notes = []
+    block = policy.build_ingress_block(
+        [],
+        [],
+        None,
+        note=notes.append,
+        public_enabled=False,
+        private_plan=_Plan("ALLOW_ALL_REGISTERED_ENDPOINTS"),
+    ).as_dict()
+    assert block["public_access"]["restriction_mode"] == "RESTRICTED_ACCESS"
+    assert not notes  # nothing to warn about dropping when there were no IP ACLs
+
+
 def test_policy_name_single_truncates_prefix():
     assert policy.policy_name("np-helper") == "np-helper"
     long = policy.policy_name("x" * 50)

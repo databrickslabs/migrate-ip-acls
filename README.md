@@ -3,7 +3,7 @@
 [![CI](https://github.com/databrickslabs/migrate-ip-acls/actions/workflows/ci.yml/badge.svg)](https://github.com/databrickslabs/migrate-ip-acls/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/databrickslabs/migrate-ip-acls/branch/main/graph/badge.svg)](https://codecov.io/gh/databrickslabs/migrate-ip-acls)
 
-Recreate a Databricks workspace's **existing IP access list** as a **context-based ingress (CBI) policy** via a single, focused CLI: **`dbx-migrate-ip-acls`**.
+Recreate a Databricks workspace's **existing IP access list** — and its **front-end PrivateLink** (AWS / GCP) — as a **context-based ingress (CBI) policy** via a single, focused CLI: **`dbx-migrate-ip-acls`**.
 > 💡 Looking for traffic-analysis-based ingress/egress policy generation? Those live in the sibling tool - 
 > **[databricks-network-policy-helper](https://github.com/andyweaves/databricks-network-policy-helper)**
 > (`ingress` / `egress`). 
@@ -63,7 +63,7 @@ flowchart LR
 
     WSC -->|"read IP access lists +<br/>enableIpAccessLists toggle"| WAPI["Databricks<br/>Workspace API"]
     ENG -. builds policy .-> ACC
-    ACC -->|"pre-checks: PrivateLink /<br/>assigned policy · create + assign"| AAPI["Databricks<br/>Account API"]
+    ACC -->|"pre-checks: assigned policy ·<br/>read Private Access Settings ·<br/>create + assign"| AAPI["Databricks<br/>Account API"]
     EXP -. writes .-> FILES[["&lt;policy-id&gt;.json<br/>&lt;policy-id&gt;.tf"]]
 
     classDef you fill:#e2e3e5,stroke:#6c757d,color:#111
@@ -84,20 +84,26 @@ flowchart LR
 flowchart TD
     A(["dbx-migrate-ip-acls"]) --> B{"Confirm target workspace?"}
     B -->|no| X1["Abort — nothing written"]
-    B -->|yes| ACCT["Account access (prompt account_id)<br/>run pre-checks before reading the IP ACLs"]
-    ACCT --> PAS{"PrivateLink? (non-Azure only: workspace PAS<br/>attached or account VPC endpoints > 0)"}
-    PAS -->|yes| X2["ABORT — not supported yet"]
-    PAS -->|"no / Azure (checks skipped)"| AS0{"Will create AND assign?"}
-    AS0 -->|"yes: existing CBI policy with ingress rules<br/>(enforced OR dry-run)"| X3["ABORT — not supported yet"]
-    AS0 -->|"yes: none / allow-all"| GATE{"enableIpAccessLists × rule count<br/>(read IP access lists)"}
-    AS0 -->|"no: propose-only"| GATE
-    GATE -->|"enabled + 0 rules"| X4["No rules — nothing to migrate, stop"]
-    GATE -->|"disabled + 0 rules"| X4
-    GATE -->|"disabled + rules → enable & continue"| REEN["Set enableIpAccessLists=true — continue"]
-    GATE -->|"disabled + rules → decline / --yes"| X6["Not active — nothing to migrate, stop"]
+    B -->|yes| ACCT["Account access (prompt account_id) · pre-checks"]
+    ACCT --> PL{"Front-end PrivateLink? (per cloud)"}
+    PL -->|"AWS / GCP: PAS attached<br/>(GCP = PSC, same PAS object)"| PLM["Read PAS → migrate private access as-is<br/>(public toggle + endpoint scope)"]
+    PL -->|"Azure"| PLZ["Nothing to migrate (Azure PEs allowed by CBI<br/>by default) — migrate IP ACLs only"]
+    PL -->|"none attached"| RDACL
+    PLM --> RDACL["Read IP access lists + the existing assigned CBI policy"]
+    PLZ --> RDACL
+    RDACL --> CFL{"Assigning AND a legacy source collides with a<br/>restrictive CBI block of the SAME dimension?<br/>(public: IP ACLs / toggle · private: endpoint-scoped PAS)"}
+    CFL -->|yes| X3["ABORT — can't migrate over it"]
+    CFL -->|"no — copy existing CBI blocks<br/>for the dimensions not migrated"| GATE{"enableIpAccessLists<br/>(master toggle)"}
+    GATE -->|"public disabled (PrivateLink-only)"| NAME
+    GATE -->|"ON + 0 rules / OFF + 0 rules, no PL"| X4["No active rules — nothing to migrate, stop"]
+    GATE -->|"ON + 1+ rules"| NAME
+    GATE -->|"ON + 0 rules, front-end PL present"| NAME
+    GATE -->|"OFF + rules → offer re-enable: YES"| REEN["Set enableIpAccessLists=true<br/>— migrate the now-active lists"]
+    GATE -->|"OFF + rules → decline / non-interactive / propose-only:<br/>dormant lists NOT migrated, front-end PL present"| NAME
+    GATE -->|"OFF + rules → decline / non-interactive, no PL"| X6["Nothing active — nothing to migrate, stop"]
     REEN --> NAME
-    GATE -->|"enabled + 1+ rules"| NAME["Resolve policy name (prompt; blank = profile)<br/>must be unique — re-prompt if it exists"]
-    NAME --> RD["ALLOW → allow, BLOCK → deny (IPv4, ENABLED only)<br/>labels verbatim; disabled lists flagged, not migrated"]
+    NAME["Resolve policy name (prompt; blank = profile)<br/>must be unique — re-prompt if it exists"]
+    NAME --> RD["ALLOW → allow, BLOCK → deny (IPv4, ENABLED only)<br/>labels verbatim; disabled lists flagged, not migrated.<br/>PAS → private access as-is; public-disabled → deny-all public;<br/>existing CBI blocks preserved for non-migrated dimensions"]
     RD --> P["Preview proposed policy + disabled-rule notice"]
     P --> EXP{"--export?"}
     EXP -->|yes| EXPW["Write JSON + Terraform"]
@@ -119,7 +125,7 @@ flowchart TD
     classDef done fill:#e2e3e5,stroke:#6c757d,color:#111
     classDef write fill:#d1e7dd,stroke:#146c43,color:#111
     classDef warn fill:#fff3cd,stroke:#997404,color:#111
-    class X2,X3 stop
+    class X3 stop
     class X1,X4,X5,X6,DONE done
     class WD,WE,ASB,DISB write
     class PROM,REEN warn
@@ -129,29 +135,52 @@ flowchart TD
 
 1. **Right after the workspace is chosen** — and *before* the IP access lists are read or shown —
    runs account-level **pre-checks**, so an unsupported or already-migrated workspace fails fast. It
-   prompts for the `account_id` if it wasn't passed, then aborts on **PrivateLink** — this workspace
-   has a PAS attached, or the **account** has ≥1 registered VPC endpoint (any workspace; CBI private
-   access isn't GA yet, so any PrivateLink account is blocked for now) — not supported yet; **both
-   PrivateLink checks are skipped on Azure**, which has neither concept, so an Azure workspace only
-   migrates its IP ACLs; and, only when the run will **assign** the new policy, guards an existing
-   **restrictive** CBI ingress policy already bound to the workspace — enforced **or** dry-run →
-   **abort** (migrating on top of an existing CBI ingress policy isn't supported yet). An allow-all
-   policy such as the account's baseline `default-policy` is ignored.
-2. Then decides whether there's anything to migrate, from the workspace-wide `enableIpAccessLists`
-   toggle × the number of IP access lists:
-   - **disabled + 0 rules** → nothing to migrate → exit.
-   - **disabled + 1+ rules** → the rules aren't in effect. It prints the current IP-ACL config and
-     (interactively) offers to **enable** them: **yes** → sets `enableIpAccessLists=true` and
-     **continues** in the same run; **no** → exits. `--yes` never auto-flips the toggle.
-   - **enabled + 0 rules** → nothing to migrate → exit.
-   - **enabled + 1+ rules** → proceed. (Unreadable toggle → warn + proceed.)
+   prompts for the `account_id` if it wasn't passed, then resolves **front-end PrivateLink** per
+   cloud by reading this workspace's **Private Access Settings (PAS)**:
+   - **AWS / GCP** — a PAS attached is **migrated as-is** into the new policy's `private_access` block
+     (see step 3). On GCP, front-end PrivateLink is Private Service Connect (PSC), surfaced through the
+     same PAS object, so it maps identically (the mapping is cloud-agnostic). No PAS → public-only.
+   - **Azure** — there's nothing to migrate: Azure front-end PrivateLink uses Azure Private
+     Endpoints (not a PAS), which context-based ingress allows by default, and the public
+     network-access toggle isn't being retired. So an Azure workspace migrates its IP access lists
+     only (any existing CBI private rules are still preserved — see below).
+
+   Public and private ingress are **independent dimensions**. For any dimension this migration
+   doesn't itself produce, the generated policy **preserves** (copies verbatim) the workspace's
+   existing assigned CBI block — so a workspace that already has CBI private rules keeps them when
+   its IP access lists are migrated to public. Only when the run will **assign** does it guard a true
+   same-dimension collision: a legacy public source (IP access lists / PAS public toggle) over a
+   **restrictive** CBI *public* block, or an endpoint-scoped PAS over a **restrictive** CBI *private*
+   block → **abort**. Allow-all blocks (e.g. the account's baseline `default-policy`) never collide,
+   and an account-level (allow-all) PAS never loosens a stricter existing CBI private policy.
+2. Then decides whether — and which — IP access lists to migrate, from the workspace-wide
+   `enableIpAccessLists` **master toggle**. IP access lists are migrated into the new policy's public
+   access **only when enforcement is actually active**; a list is in effect only if the master toggle
+   is on *and* the list itself is enabled. The master toggle being off means the lists are **dormant**
+   (not enforced) even if individual lists show `enabled=true`.
+   - **master on + 1+ rules** → migrate them. (Unreadable toggle → warn + treat as on.)
+   - **master on + 0 rules** → nothing to migrate → exit (unless there's front-end PrivateLink).
+   - **master off** → the lists are dormant. Whenever there are rules and the run can write (create
+     mode, interactive), it prints the current IP-ACL config and **offers to re-enable** enforcement
+     (independent of PrivateLink): **yes** → sets `enableIpAccessLists=true` and migrates the
+     now-active lists; **no** → the dormant lists are **not** migrated. A non-interactive (`--yes`) or
+     propose-only run can't re-enable, so it never migrates dormant lists. Either way, front-end
+     PrivateLink (if any) is still migrated and the existing CBI public is **preserved**; if there's
+     nothing active at all, it exits. `--yes` never auto-flips the toggle.
 3. Reads the workspace's IP access lists (`w.ip_access_lists.list()`). **Individual lists that are
    disabled are flagged and NOT migrated** — only enabled lists are; the disabled ones are called
    out in the final printout so you can vet them. Maps **ALLOW → allow rules**, **BLOCK → deny
    rules** (IPv4 only; CBI is IPv4-only), recreating each rule **verbatim** — the original ACL
    label, no prefix, no mode suffix. The one thing it adds: if the ACL has **only BLOCK lists**, a
    catch-all allow (all public IPs) is added, because CBI RESTRICTED_ACCESS is default-deny —
-   without it a deny-only policy would block everything.
+   without it a deny-only policy would block everything. On **AWS / GCP**, it also recreates the
+   workspace's **front-end PrivateLink** verbatim from its PAS: `private_access_level=ACCOUNT` →
+   `ALLOW_ALL_REGISTERED_ENDPOINTS`; `private_access_level=ENDPOINT` → a `RESTRICTED_ACCESS` private
+   rule listing the PAS's registered endpoint ids. When the PAS has **public access disabled**
+   (PrivateLink-only), the IP access lists aren't in effect, so the `public_access` block is an
+   explicit **deny-all** (RESTRICTED_ACCESS, no allow rules) rather than recreating them — public
+   ingress stays closed even if the workspace's public toggle is later re-enabled. The PAS itself and
+   the public toggle are **read, never modified**.
 4. Names the new policy from `--policy-name` (or prompts; blank = the profile name). It only
    **creates new** policies, so a name that already exists re-prompts (or aborts non-interactively).
    `--create-policy` is **on by default** (a review gate still confirms); with `--auto-assign`
@@ -161,7 +190,8 @@ flowchart TD
    and the new CBI policy don't both apply. The lists themselves are preserved (reversible).
 
 > This tool deliberately does **not** enrich or auto-allow Databricks' own control-plane IPs — it
-> assumes the existing ACL is what you want. It recreates the **ingress** (the IP ACLs) and, for
+> assumes the existing ACL is what you want. It recreates the **ingress** (the IP ACLs, plus front-end
+PrivateLink on AWS / GCP) and, for
 > **egress**, copies the egress of the policy the workspace currently runs under **verbatim** — its
 > enforcement mode, allowed internet (FQDN) + storage destinations, and blocked-internet lists — so
 > egress posture is preserved rather than reset. The source is the workspace's assigned policy, or the
