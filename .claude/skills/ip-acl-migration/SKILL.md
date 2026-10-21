@@ -60,16 +60,19 @@ options go straight after the program name.
      PAS → public-only, as before. The PAS and the public toggle are **read, never modified**.
    - **GCP — PAS attached (PSC)?** Migrating a Private Service Connect-protected GCP workspace to CBI
      isn't supported yet — it **aborts** (planned fast-follow).
-   - **Azure.** The public-network-access toggle and front-end private endpoints live in Azure
-     Resource Manager, **not** the Databricks account API, so they can't be read/migrated here. The IP
-     access lists are migrated and you're told to configure any Azure PrivateLink manually (planned
-     fast-follow).
-   - **Existing *restrictive* CBI ingress policy?** Only matters when the run will **assign** the new
-     policy, and only for a policy that **actually restricts traffic** — an allow-all policy such as
-     the account's baseline `default-policy` is ignored. When assigning over a restrictive one —
-     **enforced or dry-run** — it **aborts** (migrating on top of an existing CBI ingress policy
-     isn't supported yet). When **not** assigning (propose-only, `--export`, `--no-auto-assign`), it
-     just **warns**.
+   - **Azure.** Nothing to migrate for private: Azure front-end PrivateLink uses Azure Private
+     Endpoints (not a PAS), which CBI allows by default, and the public network-access toggle isn't
+     retired. So Azure migrates its IP access lists only (existing CBI private rules are still
+     preserved — see below).
+   - **Existing CBI policy — per-dimension.** Public and private ingress are independent. For any
+     dimension this migration doesn't itself produce, the generated policy **preserves** (copies
+     verbatim) the workspace's existing assigned CBI block (`public_access` / `private_access` /
+     `cross_workspace_access`) — so e.g. migrating IP ACLs → public keeps existing CBI private rules.
+     Only when the run will **assign** does it **abort** on a true same-dimension collision: a legacy
+     public source (IP ACLs / PAS public toggle) over a **restrictive** CBI *public* block, or an
+     endpoint-scoped PAS over a **restrictive** CBI *private* block. Allow-all blocks (e.g. the
+     baseline `default-policy`) never collide; an account-level (allow-all) PAS never loosens a
+     stricter existing CBI private policy. When **not** assigning, it just **warns**.
 4. Names the new policy from `--policy-name`; if not given it **prompts** for one (leave blank there
    to use the profile name). It only **creates new** policies, so if the chosen name already exists it
    re-prompts (interactively) or aborts. `--create-policy` is **on by default** (an interactive review

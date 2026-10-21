@@ -133,16 +133,14 @@ def build_private_access_block(restriction_mode: str, endpoint_ids: list[str], l
     return PrivateAccess(restriction_mode=RestrictionMode.RESTRICTED_ACCESS, allow_rules=rules)
 
 
-def build_ingress_block(
+def build_public_access_block(
     allow: list[dict],
     deny: list[dict],
     mode_label: str | None,
     note: Note = lambda _m: None,
     public_enabled: bool = True,
-    private_plan: object | None = None,
 ):
-    """Assemble a CustomerFacingIngressNetworkPolicy from allow specs (+ optional deny specs), plus an
-    optional private_access block for front-end PrivateLink (`private_plan`, a PrivateAccessPlan).
+    """The ingress public_access (source-IP) block from allow specs (+ optional deny specs).
 
     RESTRICTED_ACCESS is default-DENY; if a policy ends up with deny rules but no allow rules,
     everything would be blocked — add a catch-all allow (all public IPs) to preserve
@@ -153,7 +151,6 @@ def build_ingress_block(
     explicit deny-all (RESTRICTED_ACCESS with no allow rules) rather than recreating them — public
     ingress stays closed in CBI even if the workspace's public toggle is later flipped back on."""
     from databricks.sdk.service.settings import (  # noqa: I001
-        CustomerFacingIngressNetworkPolicy as IngressPolicy,
         CustomerFacingIngressNetworkPolicyPublicAccess as PublicAccess,
         CustomerFacingIngressNetworkPolicyPublicAccessRestrictionMode as RestrictionMode,
     )
@@ -165,36 +162,63 @@ def build_ingress_block(
                 "in effect — the generated policy denies all public ingress (RESTRICTED_ACCESS with "
                 "no allow rules) rather than recreating them as public rules."
             )
-        public = PublicAccess(restriction_mode=RestrictionMode.RESTRICTED_ACCESS)
-    else:
-        allow = list(allow)
-        if (deny or []) and not allow:
-            allow = [
-                {
-                    "label": "allow-all",
-                    "catch_all": True,
-                    "destination": "all_destinations",
-                    "identity_type": "ALL_USERS",
-                    "identities": [],
-                }
-            ]
-            note(
-                "Policy has deny rules but no allow rules — added a catch-all allow (all public IPs) "
-                "so non-denied traffic is still permitted (default-allow-except-blocked)."
-            )
+        return PublicAccess(restriction_mode=RestrictionMode.RESTRICTED_ACCESS)
 
-        public = PublicAccess(
-            restriction_mode=RestrictionMode.RESTRICTED_ACCESS,
-            allow_rules=[build_ingress_rule(s, mode_label) for s in allow],
-            deny_rules=[build_deny_rule(s, mode_label) for s in (deny or [])] or None,
+    allow = list(allow)
+    if (deny or []) and not allow:
+        allow = [
+            {
+                "label": "allow-all",
+                "catch_all": True,
+                "destination": "all_destinations",
+                "identity_type": "ALL_USERS",
+                "identities": [],
+            }
+        ]
+        note(
+            "Policy has deny rules but no allow rules — added a catch-all allow (all public IPs) "
+            "so non-denied traffic is still permitted (default-allow-except-blocked)."
         )
 
-    private = None
-    if private_plan is not None:
-        private = build_private_access_block(
+    return PublicAccess(
+        restriction_mode=RestrictionMode.RESTRICTED_ACCESS,
+        allow_rules=[build_ingress_rule(s, mode_label) for s in allow],
+        deny_rules=[build_deny_rule(s, mode_label) for s in (deny or [])] or None,
+    )
+
+
+def assemble_ingress(public_access=None, private_access=None, cross_workspace_access=None):
+    """Assemble a CustomerFacingIngressNetworkPolicy from independently-built (or preserved)
+    sub-blocks. Any of them may be None (omitted)."""
+    from databricks.sdk.service.settings import CustomerFacingIngressNetworkPolicy as IngressPolicy
+
+    return IngressPolicy(
+        public_access=public_access,
+        private_access=private_access,
+        cross_workspace_access=cross_workspace_access,
+    )
+
+
+def build_ingress_block(
+    allow: list[dict],
+    deny: list[dict],
+    mode_label: str | None,
+    note: Note = lambda _m: None,
+    public_enabled: bool = True,
+    private_plan: object | None = None,
+):
+    """Build a full ingress block from scratch (public + optional private) — the "migrate both
+    dimensions" path. The engine's per-dimension migrate-vs-preserve logic composes
+    build_public_access_block / build_private_access_block via assemble_ingress directly."""
+    public = build_public_access_block(allow, deny, mode_label, note, public_enabled)
+    private = (
+        build_private_access_block(
             private_plan.restriction_mode, private_plan.endpoint_ids, private_plan.label
         )
-    return IngressPolicy(public_access=public, private_access=private)
+        if private_plan is not None
+        else None
+    )
+    return assemble_ingress(public, private)
 
 
 def build_full_access_egress():

@@ -25,15 +25,26 @@ commit `vX.Y.Z` — which the release workflow then publishes to PyPI. See
   now be migrated: the IP access lists aren't recreated as public rules (they aren't in effect),
   the `public_access` block becomes an explicit deny-all, and a workspace with no IP access lists is
   no longer treated as "nothing to migrate" when it has front-end PrivateLink.
+- **Preserve existing CBI rules for non-migrated dimensions.** Public and private ingress are
+  independent. The generated policy now **preserves** (copies verbatim) the workspace's existing
+  assigned CBI policy's `private_access` / `public_access` / `cross_workspace_access` for any
+  dimension this migration doesn't itself produce — so a workspace that already has CBI private
+  rules keeps them when its IP access lists are migrated to public. An account-level (allow-all)
+  PAS never loosens a stricter existing CBI private policy.
 
 ### Changed
 
-- **Per-cloud PrivateLink handling in the pre-checks.** The former account-wide "any registered VPC
-  endpoint → abort" check is replaced by reading **this workspace's** PAS. GCP workspaces protected
-  by Private Service Connect (PSC) still abort (planned fast-follow). Azure front-end PrivateLink
-  isn't readable via the Databricks account API, so it is **not** migrated — Azure workspaces
-  migrate their IP access lists only, with a note to configure Azure PrivateLink manually (planned
-  fast-follow). No flag changes.
+- **Per-dimension conflict check replaces the blanket "existing CBI policy → abort".** Migration now
+  aborts only on a true same-dimension collision (and only when assigning): a legacy public source
+  (IP access lists / PAS public toggle) over a restrictive CBI **public** block, or an
+  endpoint-scoped PAS over a restrictive CBI **private** block. Other combinations proceed and copy
+  the existing blocks across, so public and private can be migrated in one pass.
+- **Per-cloud PrivateLink handling.** The former account-wide "any registered VPC endpoint → abort"
+  check is replaced by reading **this workspace's** PAS. GCP workspaces protected by Private Service
+  Connect (PSC) still abort (planned fast-follow). **Azure** has no front-end PrivateLink to migrate
+  (Azure uses Azure Private Endpoints, which context-based ingress allows by default, and the public
+  network-access toggle isn't retired), so Azure migrates its IP access lists only — and still
+  preserves any existing CBI private rules. No flag changes.
 
 ## [0.1.0] - 2026-09-18
 

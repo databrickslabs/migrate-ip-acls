@@ -91,6 +91,61 @@ def test_apply_sends_private_access_in_created_policy():
     assert "allow_rules" not in ingress["public_access"]  # public deny-all
 
 
+def test_build_preserves_existing_private_when_no_pas():
+    # migrate public from IP ACLs, and preserve the workspace's existing CBI private verbatim
+    from dbx_migrate_ip_acls import policy as pol
+
+    ws = _FakeWs([_FakeAcl("office", "ALLOW", True, ["8.8.8.8/32"])])
+    cfg = AclConfig(policy_mode="enforce")
+    a = acl_core.analyze(cfg, ws)
+    a.existing_private = pol.build_private_access_block("RESTRICTED_ACCESS", ["el-x"], "existing")
+    ingress = acl_core.preview_block(a, cfg)["ingress"]
+    assert ingress["public_access"]["allow_rules"][0]["label"] == "office"  # migrated public
+    assert ingress["private_access"]["allow_rules"][0]["origin"]["endpoints"]["endpoint_ids"] == ["el-x"]
+
+
+def test_build_allow_all_pas_preserves_restrictive_existing_private():
+    # allow-all (account-level) PAS must NOT loosen an existing restrictive CBI private — keep stricter
+    from dbx_migrate_ip_acls import policy as pol
+
+    ws = _FakeWs([_FakeAcl("office", "ALLOW", True, ["8.8.8.8/32"])])
+    cfg = AclConfig()
+    a = acl_core.analyze(cfg, ws)
+    a.private_plan = acl_core.PrivateAccessPlan(restriction_mode="ALLOW_ALL_REGISTERED_ENDPOINTS")
+    a.existing_private = pol.build_private_access_block("RESTRICTED_ACCESS", ["el-keep"], "existing")
+    priv = acl_core.preview_block(a, cfg)["ingress"]["private_access"]
+    assert priv["restriction_mode"] == "RESTRICTED_ACCESS"  # stricter existing preserved, not allow-all
+    assert priv["allow_rules"][0]["origin"]["endpoints"]["endpoint_ids"] == ["el-keep"]
+
+
+def test_build_preserves_existing_public_when_no_ip_acls():
+    # no IP ACLs and public enabled -> not migrating public -> preserve existing CBI public
+    from dbx_migrate_ip_acls import policy as pol
+
+    ws = _FakeWs([])
+    cfg = AclConfig()
+    a = acl_core.analyze(cfg, ws)
+    a.existing_public = pol.build_public_access_block([{"label": "corp", "cidrs": ["1.2.3.0/24"]}], [], None)
+    a.private_plan = acl_core.PrivateAccessPlan(restriction_mode="RESTRICTED_ACCESS", endpoint_ids=["el-1"])
+    ingress = acl_core.preview_block(a, cfg)["ingress"]
+    assert ingress["public_access"]["allow_rules"][0]["label"] == "corp"  # preserved existing public
+    assert ingress["private_access"]["allow_rules"][0]["origin"]["endpoints"]["endpoint_ids"] == ["el-1"]
+
+
+def test_build_carries_over_cross_workspace_access():
+    from databricks.sdk.service.settings import (  # noqa: I001
+        CustomerFacingIngressNetworkPolicyCrossWorkspaceAccess as XWS,
+        CustomerFacingIngressNetworkPolicyCrossWorkspaceAccessRestrictionMode as XWSMode,
+    )
+
+    ws = _FakeWs([_FakeAcl("office", "ALLOW", True, ["8.8.8.8/32"])])
+    cfg = AclConfig()
+    a = acl_core.analyze(cfg, ws)
+    a.existing_xws = XWS(restriction_mode=XWSMode.RESTRICTED_ACCESS)
+    ingress = acl_core.preview_block(a, cfg)["ingress"]
+    assert ingress["cross_workspace_access"]["restriction_mode"] == "RESTRICTED_ACCESS"
+
+
 def test_acl_analyze_all_disabled_leaves_nothing_to_migrate():
     ws = _FakeWs([_FakeAcl("off", "ALLOW", False, ["1.1.1.1/32"])])
     a = acl_core.analyze(AclConfig(), ws)
@@ -537,26 +592,40 @@ def test_assigned_policy_returns_id_and_object():
     assert acl_core.assigned_policy(_policy_account(None, None), 42) == (None, None)
 
 
-def test_assigned_ingress_state_none_when_unassigned():
-    assert acl_core.assigned_ingress_state(_policy_account(None, None), 42) == (None, None)
+def test_existing_cbi_ingress_none_when_unassigned():
+    assert acl_core.existing_cbi_ingress(_policy_account(None, None), 42) == (None, None, None, None)
 
 
-def test_assigned_ingress_state_ignores_allow_all_policy():
-    # temp / default-policy: dry-run block present but fully permissive -> no blocker (state None)
+def test_existing_cbi_ingress_drops_permissive_blocks():
+    # temp / default-policy: a dry-run block present but fully permissive -> nothing worth preserving
     allow_all = type("P", (), {"ingress": None, "ingress_dry_run": _ingress()})()
-    assert acl_core.assigned_ingress_state(_policy_account("default-policy", allow_all), 42) == (
+    assert acl_core.existing_cbi_ingress(_policy_account("default-policy", allow_all), 42) == (
         "default-policy",
+        None,
+        None,
         None,
     )
 
 
-def test_assigned_ingress_state_enforced_dry_run_when_restrictive():
+def test_existing_cbi_ingress_preserves_only_restrictive_sub_blocks():
+    # a restrictive PRIVATE block (enforced) is preserved (deep-copied); the permissive public is not
     enforced = type(
-        "P", (), {"ingress": _ingress(public_mode="RESTRICTED_ACCESS"), "ingress_dry_run": None}
+        "P", (), {"ingress": _ingress(private_mode="RESTRICTED_ACCESS"), "ingress_dry_run": None}
     )()
-    assert acl_core.assigned_ingress_state(_policy_account("p1", enforced), 42) == ("p1", "enforced")
+    pid, pub, priv, xws = acl_core.existing_cbi_ingress(_policy_account("p1", enforced), 42)
+    assert pid == "p1"
+    assert pub is None  # public was FULL_ACCESS -> dropped
+    assert priv is not None and priv.restriction_mode == "RESTRICTED_ACCESS"
+    assert xws is None
+
+
+def test_existing_cbi_ingress_reads_dry_run_block():
+    # when the policy's rules live in ingress_dry_run, that's the block we read
     dry = type("P", (), {"ingress": None, "ingress_dry_run": _ingress(public_mode="RESTRICTED_ACCESS")})()
-    assert acl_core.assigned_ingress_state(_policy_account("p2", dry), 42) == ("p2", "dry_run")
+    pid, pub, priv, xws = acl_core.existing_cbi_ingress(_policy_account("p2", dry), 42)
+    assert pid == "p2"
+    assert pub is not None and pub.restriction_mode == "RESTRICTED_ACCESS"
+    assert priv is None
 
 
 def test_acl_policy_payload_is_curl_ready():

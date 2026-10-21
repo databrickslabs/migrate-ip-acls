@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from . import console
+from . import acl, console
 from .config import AclConfig
 
 
@@ -86,12 +86,30 @@ def acl_disabled_notice(analysis) -> None:
 
 
 def acl_private_access(analysis) -> None:
-    """Show the front-end PrivateLink that will be recreated in the new policy's private_access block
-    (nothing is shown when the workspace has none)."""
+    """Show what the generated policy's private_access will be — the front-end PrivateLink migrated
+    from the PAS, or the workspace's existing CBI private rules preserved verbatim. Nothing is shown
+    when there's neither."""
     plan = getattr(analysis, "private_plan", None)
+    existing_private = getattr(analysis, "existing_private", None)
     if plan is None:
+        if existing_private is not None:
+            console.rule("Private access")
+            console.banner(
+                "info",
+                "The workspace's existing CBI private access rules are preserved verbatim in the new "
+                "policy (this migration doesn't change private access on this workspace). Review them "
+                "in the JSON preview below.",
+            )
         return
     console.rule("Front-end PrivateLink → private access")
+    if plan.restriction_mode == "ALLOW_ALL_REGISTERED_ENDPOINTS" and acl.block_restrictive(existing_private):
+        console.banner(
+            "info",
+            "Front-end PrivateLink is account-level (all registered endpoints), but the workspace "
+            "already has stricter CBI private access — the existing restrictive private rules are "
+            "preserved rather than loosened. Review them in the JSON preview below.",
+        )
+        return
     if plan.restriction_mode == "ALLOW_ALL_REGISTERED_ENDPOINTS":
         detail = "all registered private endpoints (ALLOW_ALL_REGISTERED_ENDPOINTS)"
     elif plan.endpoint_ids:
