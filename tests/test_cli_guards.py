@@ -644,7 +644,7 @@ def _acl_analysis(enabled=1, disabled=0):
 
 def test_acl_ip_gate_proceeds_when_enabled_with_rules(monkeypatch):
     monkeypatch.setattr("dbx_migrate_ip_acls.acl.ip_acl_enforcement_state", lambda wc: True)
-    cli._acl_ip_gate(_acl_analysis(enabled=1), object(), yes=True)  # must not raise
+    assert cli._acl_ip_gate(_acl_analysis(enabled=1), object(), yes=True) is True  # migrate the lists
 
 
 def test_acl_ip_gate_enabled_no_rules_exits(monkeypatch, capsys):
@@ -664,8 +664,7 @@ def test_acl_ip_gate_disabled_no_rules_exits(monkeypatch, capsys):
     with pytest.raises(typer.Exit) as e:
         cli._acl_ip_gate(_acl_analysis(enabled=0), object(), yes=True)
     assert e.value.exit_code == 0
-    out = capsys.readouterr().out.lower()
-    assert "disabled" in out and "no rules" in out
+    assert "enforced" in capsys.readouterr().out.lower()  # "no enforced IP access lists"
 
 
 def test_acl_ip_gate_disabled_with_rules_noninteractive_aborts(monkeypatch):
@@ -703,10 +702,39 @@ def test_acl_ip_gate_disabled_with_rules_accept_reenable_and_continues(monkeypat
         "dbx_migrate_ip_acls.acl.enable_ip_access_lists",
         lambda *a, **k: called.__setitem__("n", called["n"] + 1),
     )
-    # accept -> re-enable, then CONTINUE the run (must not raise).
-    cli._acl_ip_gate(_acl_analysis(enabled=1), object(), yes=False)
+    # accept -> re-enable, then CONTINUE the run migrating the lists (returns True).
+    assert cli._acl_ip_gate(_acl_analysis(enabled=1), object(), yes=False) is True
     assert called["n"] == 1
-    assert "continuing" in capsys.readouterr().out.lower()
+    assert "now-active" in capsys.readouterr().out.lower()
+
+
+def test_acl_ip_gate_disabled_with_private_non_interactive_skips_lists(monkeypatch, capsys):
+    # toggle OFF + dormant lists + front-end PrivateLink, non-interactive: do NOT migrate the dormant
+    # lists (can't re-enable), but proceed for private -> returns False (caller drops public specs).
+    monkeypatch.setattr("dbx_migrate_ip_acls.acl.ip_acl_enforcement_state", lambda wc: False)
+    a = _acl_analysis(enabled=2)
+    a.private_plan = object()
+    a.public_access_enabled = True
+    assert cli._acl_ip_gate(a, object(), yes=True, create_policy=True) is False
+    out = _squash(capsys.readouterr().out).lower()
+    assert "notenforced" in out and "preserved" in out
+
+
+def test_acl_ip_gate_disabled_decline_with_private_skips_lists(monkeypatch, capsys):
+    # toggle OFF + dormant lists + PrivateLink, interactive decline -> returns False, no re-enable.
+    monkeypatch.setattr("dbx_migrate_ip_acls.acl.ip_acl_enforcement_state", lambda wc: False)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("typer.confirm", lambda *a, **k: False)
+    called = {"n": 0}
+    monkeypatch.setattr(
+        "dbx_migrate_ip_acls.acl.enable_ip_access_lists",
+        lambda *a, **k: called.__setitem__("n", called["n"] + 1),
+    )
+    a = _acl_analysis(enabled=1)
+    a.private_plan = object()
+    a.public_access_enabled = True
+    assert cli._acl_ip_gate(a, object(), yes=False, create_policy=True) is False
+    assert called["n"] == 0  # declined -> not re-enabled
 
 
 def test_ensure_acl_policy_name_unique_reprompts_then_accepts(monkeypatch):
@@ -1472,8 +1500,11 @@ def test_reconcile_enables_only_the_selected_subset_and_reanalyzes(monkeypatch):
 # --- propose-only runs must not offer/perform re-enables (no writes) ---------------------------
 
 
-def test_acl_ip_gate_disabled_propose_only_skips_reenable(monkeypatch, capsys):
-    # toggle OFF + rules + --no-create-policy: must NOT prompt or enable enforcement; proceeds.
+def test_acl_ip_gate_disabled_propose_only_does_not_migrate_dormant(monkeypatch, capsys):
+    # toggle OFF + rules + --no-create-policy: must NOT prompt or enable enforcement. The dormant
+    # lists are not migrated, and with nothing else active it exits cleanly (nothing to migrate).
+    import typer
+
     monkeypatch.setattr("dbx_migrate_ip_acls.acl.ip_acl_enforcement_state", lambda wc: False)
     monkeypatch.setattr("sys.stdin.isatty", lambda: True)
     monkeypatch.setattr(
@@ -1484,8 +1515,10 @@ def test_acl_ip_gate_disabled_propose_only_skips_reenable(monkeypatch, capsys):
         "dbx_migrate_ip_acls.acl.enable_ip_access_lists",
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("propose-only must not enable")),
     )
-    cli._acl_ip_gate(_acl_analysis(enabled=1), object(), yes=False, create_policy=False)  # no raise
-    assert "propose-only" in capsys.readouterr().out.lower()
+    with pytest.raises(typer.Exit) as e:
+        cli._acl_ip_gate(_acl_analysis(enabled=1), object(), yes=False, create_policy=False)
+    assert e.value.exit_code == 0
+    assert "enforced" in capsys.readouterr().out.lower()
 
 
 def test_reconcile_propose_only_flags_but_does_not_offer(monkeypatch, capsys):

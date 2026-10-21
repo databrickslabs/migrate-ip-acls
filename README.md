@@ -94,15 +94,16 @@ flowchart TD
     PLZ --> RDACL
     RDACL --> CFL{"Assigning AND a legacy source collides with a<br/>restrictive CBI block of the SAME dimension?<br/>(public: IP ACLs / toggle · private: endpoint-scoped PAS)"}
     CFL -->|yes| X3["ABORT — can't migrate over it"]
-    CFL -->|"no — copy existing CBI blocks<br/>for the dimensions not migrated"| GATE{"enableIpAccessLists × rule count"}
+    CFL -->|"no — copy existing CBI blocks<br/>for the dimensions not migrated"| GATE{"enableIpAccessLists<br/>(master toggle)"}
     GATE -->|"public disabled (PrivateLink-only)"| NAME
-    GATE -->|"0 rules, but front-end PL present"| NAME
-    GATE -->|"enabled + 0 rules, no PL"| X4["No rules — nothing to migrate, stop"]
-    GATE -->|"disabled + 0 rules, no PL"| X4
-    GATE -->|"disabled + rules → enable & continue"| REEN["Set enableIpAccessLists=true — continue"]
-    GATE -->|"disabled + rules → decline / --yes, no PL"| X6["Not active — nothing to migrate, stop"]
+    GATE -->|"ON + 0 rules / OFF + 0 rules, no PL"| X4["No active rules — nothing to migrate, stop"]
+    GATE -->|"ON + 1+ rules"| NAME
+    GATE -->|"ON + 0 rules, front-end PL present"| NAME
+    GATE -->|"OFF + rules → offer re-enable: YES"| REEN["Set enableIpAccessLists=true<br/>— migrate the now-active lists"]
+    GATE -->|"OFF + rules → decline / non-interactive / propose-only:<br/>dormant lists NOT migrated, front-end PL present"| NAME
+    GATE -->|"OFF + rules → decline / non-interactive, no PL"| X6["Nothing active — nothing to migrate, stop"]
     REEN --> NAME
-    GATE -->|"enabled + 1+ rules"| NAME["Resolve policy name (prompt; blank = profile)<br/>must be unique — re-prompt if it exists"]
+    NAME["Resolve policy name (prompt; blank = profile)<br/>must be unique — re-prompt if it exists"]
     NAME --> RD["ALLOW → allow, BLOCK → deny (IPv4, ENABLED only)<br/>labels verbatim; disabled lists flagged, not migrated.<br/>PAS → private access as-is; public-disabled → deny-all public;<br/>existing CBI blocks preserved for non-migrated dimensions"]
     RD --> P["Preview proposed policy + disabled-rule notice"]
     P --> EXP{"--export?"}
@@ -154,14 +155,20 @@ flowchart TD
    **restrictive** CBI *public* block, or an endpoint-scoped PAS over a **restrictive** CBI *private*
    block → **abort**. Allow-all blocks (e.g. the account's baseline `default-policy`) never collide,
    and an account-level (allow-all) PAS never loosens a stricter existing CBI private policy.
-2. Then decides whether there's anything to migrate, from the workspace-wide `enableIpAccessLists`
-   toggle × the number of IP access lists:
-   - **disabled + 0 rules** → nothing to migrate → exit.
-   - **disabled + 1+ rules** → the rules aren't in effect. It prints the current IP-ACL config and
-     (interactively) offers to **enable** them: **yes** → sets `enableIpAccessLists=true` and
-     **continues** in the same run; **no** → exits. `--yes` never auto-flips the toggle.
-   - **enabled + 0 rules** → nothing to migrate → exit.
-   - **enabled + 1+ rules** → proceed. (Unreadable toggle → warn + proceed.)
+2. Then decides whether — and which — IP access lists to migrate, from the workspace-wide
+   `enableIpAccessLists` **master toggle**. IP access lists are migrated into the new policy's public
+   access **only when enforcement is actually active**; a list is in effect only if the master toggle
+   is on *and* the list itself is enabled. The master toggle being off means the lists are **dormant**
+   (not enforced) even if individual lists show `enabled=true`.
+   - **master on + 1+ rules** → migrate them. (Unreadable toggle → warn + treat as on.)
+   - **master on + 0 rules** → nothing to migrate → exit (unless there's front-end PrivateLink).
+   - **master off** → the lists are dormant. Whenever there are rules and the run can write (create
+     mode, interactive), it prints the current IP-ACL config and **offers to re-enable** enforcement
+     (independent of PrivateLink): **yes** → sets `enableIpAccessLists=true` and migrates the
+     now-active lists; **no** → the dormant lists are **not** migrated. A non-interactive (`--yes`) or
+     propose-only run can't re-enable, so it never migrates dormant lists. Either way, front-end
+     PrivateLink (if any) is still migrated and the existing CBI public is **preserved**; if there's
+     nothing active at all, it exits. `--yes` never auto-flips the toggle.
 3. Reads the workspace's IP access lists (`w.ip_access_lists.list()`). **Individual lists that are
    disabled are flagged and NOT migrated** — only enabled lists are; the disabled ones are called
    out in the final printout so you can vet them. Maps **ALLOW → allow rules**, **BLOCK → deny

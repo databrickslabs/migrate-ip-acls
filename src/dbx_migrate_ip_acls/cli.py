@@ -788,22 +788,26 @@ def _maybe_disable_ip_acls(disable: bool, results: list[dict], workspace_client)
         )
 
 
-def _acl_ip_gate(analysis, wc, yes: bool, create_policy: bool = True) -> None:
-    """Right after the workspace is chosen, decide whether there's anything to migrate, based on the
-    workspace-wide `enableIpAccessLists` toggle × the number of IP access lists:
-      * disabled + 0 rules  → nothing to migrate (exit);
-      * disabled + 1+ rules → print the current config; when creating a policy, offer to re-enable
-        enforcement (interactively). A propose-only run (no --create-policy) never writes, so it
-        skips the offer and just previews from the individually-enabled lists;
-      * enabled  + 0 rules  → nothing to migrate (exit);
-      * enabled  + 1+ rules → show the current config, then proceed.
-    A read failure on the toggle (None) just warns and proceeds. All exits are clean (code 0).
+def _acl_ip_gate(analysis, wc, yes: bool, create_policy: bool = True) -> bool:
+    """Decide whether the workspace's IP access lists get migrated into the new policy's public
+    access, from the workspace-wide `enableIpAccessLists` master toggle × the number of lists.
 
-    Front-end PrivateLink shifts this: when the workspace has public access disabled
-    (PrivateLink-only) the IP access lists aren't in effect, so the public quadrant is skipped
-    entirely — the current lists are shown for context and the run proceeds to migrate the private
-    access. And whenever there's a private_plan to migrate, a 0-rule IP ACL config is no longer
-    "nothing to migrate" — the run proceeds on the private access alone."""
+    Returns `migrate_ip_acls`: True when the lists will be migrated (enforcement is on, or the user
+    re-enables it in this run), False when they will NOT (the master toggle is off and we're not
+    re-enabling). The caller drops the public specs when this is False, so **only the active posture
+    is migrated** — dormant lists (individually enabled, but not enforced because the master toggle
+    is off) are never silently turned into active public rules. Exits cleanly when there's nothing
+    to migrate at all.
+
+    Behaviour:
+      * master toggle ON  + rules → migrate them (show the config).
+      * master toggle ON  + 0 rules → nothing to migrate (unless there's front-end PrivateLink).
+      * master toggle OFF → the lists are dormant. Whenever there are rules AND we can write
+        (create mode, interactive), **offer to re-enable** enforcement (independent of PrivateLink);
+        yes → migrate them, no → don't. Non-interactive / propose-only can't re-enable → don't
+        migrate the lists. Either way, if there's front-end PrivateLink it's still migrated, and the
+        existing CBI public is preserved; otherwise there's nothing active → exit.
+      * unreadable toggle (None) → warn + treat as on."""
     import sys
 
     from . import acl as acl_core
@@ -811,88 +815,62 @@ def _acl_ip_gate(analysis, wc, yes: bool, create_policy: bool = True) -> None:
     toggle = acl_core.ip_acl_enforcement_state(wc)
     total = len(analysis.ip_acls) + len(analysis.disabled_acls)
     has_private = getattr(analysis, "private_plan", None) is not None
+    public_disabled = not getattr(analysis, "public_access_enabled", True)
 
-    if not getattr(analysis, "public_access_enabled", True):
-        # PrivateLink-only workspace: public internet access is off, so the IP access lists aren't
-        # evaluated and the public block becomes a deny-all. There's no public quadrant to resolve —
-        # show the current lists for context (if any) and proceed to migrate the private access.
+    def _proceed_private_or_exit(reason: str) -> bool:
+        # The IP access lists won't be migrated. Continue only if there's still something to migrate
+        # (front-end PrivateLink, or a public-disabled deny-all); otherwise nothing is active → exit.
+        if has_private or public_disabled:
+            console.banner("info", f"{reason} The existing public access (if any) is preserved.")
+            return False
+        console.banner("info", f"{reason} There is nothing active to migrate.")
+        raise typer.Exit(code=0)
+
+    if public_disabled:
+        # PrivateLink-only workspace: public internet access is off, so the IP access lists aren't in
+        # effect and the public block becomes a deny-all (driven by public_access_enabled, not the
+        # lists). Don't migrate the lists; migrate the private access.
         if total:
             render.acl_current_config(analysis, workspace_enabled=bool(toggle))
         console.banner(
             "info",
             "Public network access is disabled on this workspace (PrivateLink-only) — the IP access "
             "lists are not in effect and are not migrated as public rules; migrating the front-end "
-            "PrivateLink (private access) only.",
+            "PrivateLink (private access), public denied.",
         )
-        return
+        return False
 
     if toggle is False:
-        if total == 0:
-            if has_private:
-                return  # no public IP ACLs, but there's front-end PrivateLink to migrate
+        if total:
+            render.acl_current_config(analysis, workspace_enabled=False)
             console.banner(
-                "info",
-                "This workspace's IP access lists are disabled and have no rules. "
-                "There is nothing to migrate.",
+                "warn",
+                "This workspace's IP access lists are NOT enforced (enableIpAccessLists=false) — the "
+                "rules are dormant, so they are not migrated unless you re-enable enforcement.",
             )
-            raise typer.Exit(code=0)
-        render.acl_current_config(analysis, workspace_enabled=False)
-        if not create_policy:
-            # Propose-only run: never write, so don't offer to re-enable enforcement. Preview from
-            # the individually-enabled lists; re-enabling is offered only when creating a policy.
-            console.banner(
-                "info",
-                "This workspace's IP access lists are disabled (not enforced). This is a "
-                "propose-only run, so nothing will be changed — the preview below is built from the "
-                "individually-enabled lists. Re-run with --create-policy to be offered to re-enable "
-                "your IP access lists.",
+            # Offer to re-enable (a workspace write) only when we can: create mode + interactively.
+            # This is independent of whether there's front-end PrivateLink to migrate.
+            if create_policy and not yes and sys.stdin.isatty():
+                if typer.confirm(
+                    typer.style("Re-enable IP access list enforcement and migrate these rules?", fg="yellow"),
+                    default=False,
+                ):
+                    acl_core.enable_ip_access_lists(wc, note=lambda m: console.banner("info", m))
+                    console.banner("info", "Enabled — the now-active rules will be migrated.")
+                    return True
+                return _proceed_private_or_exit("Leaving the IP access lists disabled (not migrated).")
+            # Can't offer (non-interactive or propose-only): don't migrate the dormant lists.
+            hint = "Re-run interactively with --create-policy to be offered to re-enable and migrate them."
+            return _proceed_private_or_exit(
+                f"The IP access lists are not enforced, so they are not migrated. {hint}"
             )
-            return  # proceed to preview (the empty-check handles 'no enabled lists')
-        # The workspace-off warning sits last, directly above the enable prompt. (Individually-
-        # disabled lists are flagged + offered for re-enable just after the gate, in _run_acl.)
-        console.banner(
-            "warn",
-            "This workspace's IP access lists are disabled, so there are no currently active rules "
-            "to migrate.",
-        )
-        if yes or not sys.stdin.isatty():
-            if has_private:
-                console.banner(
-                    "info",
-                    "The IP access lists are disabled (not re-enabled non-interactively), so only "
-                    "the front-end PrivateLink (private access) is migrated.",
-                )
-                return
-            console.banner(
-                "info",
-                "Re-run interactively to enable them, or set "
-                "enableIpAccessLists=true manually, then re-run — aborting.",
-            )
-            raise typer.Exit(code=0)
-        if typer.confirm(
-            typer.style(
-                "Would you like to re-enable your IP access lists to continue with the migration?",
-                fg="yellow",
-            ),
-            default=False,
-        ):
-            acl_core.enable_ip_access_lists(wc, note=lambda m: console.banner("info", m))
-            console.banner("info", "Enabled — continuing with the migration of the now-active rules.")
-            return  # proceed with the run
-        if has_private:
-            console.banner(
-                "info",
-                "Leaving the IP access lists disabled — migrating the front-end PrivateLink (private "
-                "access) only.",
-            )
-            return
-        console.banner("info", "Nothing to migrate — the IP access lists are not active. Aborting.")
-        raise typer.Exit(code=0)
+        # master off, no lists at all
+        return _proceed_private_or_exit("This workspace has no enforced IP access lists.")
 
-    # toggle is True or None (unknown).
+    # toggle is True or None (unknown) — treat as enforced.
     if total == 0:
         if has_private:
-            return  # no public IP ACLs, but there's front-end PrivateLink to migrate
+            return True  # no public IP ACLs, but there's front-end PrivateLink to migrate
         console.banner(
             "info", "This workspace's IP access lists have no rules. There is nothing to " "migrate."
         )
@@ -904,6 +882,7 @@ def _acl_ip_gate(analysis, wc, yes: bool, create_policy: bool = True) -> None:
     # Enforcement is on (or assumed on) and there are rules — show the current config before we
     # proceed, so the table is always visible (not just in the disabled-toggle branch above).
     render.acl_current_config(analysis, workspace_enabled=True)
+    return True
 
 
 def _ensure_acl_policy_name_unique(cfg: AclConfig, account, workspace_id, yes: bool) -> None:
@@ -1137,9 +1116,16 @@ def _run_acl(cfg: AclConfig, conn: Connection, yes: bool) -> None:
     # independent). Only aborts when assigning AND a legacy source collides with a restrictive block
     # of the same dimension; otherwise the existing blocks are preserved by build.
     _acl_conflict_gate(analysis, assigned_id, will_assign=cfg.create_policy and cfg.auto_assign)
-    _acl_ip_gate(analysis, wc, yes, cfg.create_policy)
-    # Flag any individually-disabled lists and offer to re-enable + include them (may re-read).
-    analysis = _apply_posture(_reconcile_disabled_lists(analysis, cfg, wc, yes))
+    # Decide whether the IP access lists are migrated at all (they are only when enforcement is on,
+    # or the user re-enables it here). When not, drop the public specs so dormant lists aren't turned
+    # into active public rules — the existing CBI public is preserved instead.
+    migrate_ip_acls = _acl_ip_gate(analysis, wc, yes, cfg.create_policy)
+    if migrate_ip_acls:
+        # Flag any individually-disabled lists and offer to re-enable + include them (may re-read).
+        analysis = _apply_posture(_reconcile_disabled_lists(analysis, cfg, wc, yes))
+    else:
+        analysis.allow_specs = []
+        analysis.deny_specs = []
     if not (
         analysis.allow_specs
         or analysis.deny_specs

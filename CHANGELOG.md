@@ -32,6 +32,17 @@ commit `vX.Y.Z` — which the release workflow then publishes to PyPI. See
   rules keeps them when its IP access lists are migrated to public. An account-level (allow-all)
   PAS never loosens a stricter existing CBI private policy.
 
+### Fixed
+
+- **Dormant IP access lists are no longer migrated.** When the workspace master toggle
+  `enableIpAccessLists` is **off**, its IP access lists are not enforced — even if individual lists
+  have `enabled=true`. Previously, proceeding on such a workspace (e.g. for front-end PrivateLink)
+  would still turn those dormant lists into active public rules and overwrite the workspace's
+  actually-enforced CBI public. Now the tool migrates IP access lists **only when enforcement is on,
+  or the operator re-enables it in this run**. The re-enable offer is made whenever the toggle is
+  off and there are rules (independent of PrivateLink); if declined (or the run is non-interactive /
+  propose-only), no IP access list rules are migrated and the existing CBI public is preserved.
+
 ### Changed
 
 - **Per-dimension conflict check replaces the blanket "existing CBI policy → abort".** Migration now

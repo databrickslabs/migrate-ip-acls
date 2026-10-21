@@ -28,19 +28,23 @@ options go straight after the program name.
 
 ## What it does
 
-1. **Right after the workspace is chosen**, decides whether there's anything to migrate, from the
-   workspace-wide `enableIpAccessLists` toggle × the number of IP access lists:
-   - **disabled + 0 rules** → "disabled and have no rules. Nothing to migrate." → **exit**.
-   - **disabled + 1+ rules** → the rules aren't in effect, so there's nothing enabled to migrate. It
-     **prints the current IP-ACL config** and (interactively) offers to **enable** them: **yes** →
-     sets `enableIpAccessLists=true` and **continues** the migration in the same run; **no** → exits
-     (nothing to migrate). `--yes` never auto-flips the toggle — it exits with guidance.
-   - **enabled + 0 rules** → "have no rules. Nothing to migrate." → **exit**.
-   - **enabled + 1+ rules** → **proceed**. (Unreadable toggle → warn + proceed.)
+1. **Right after the workspace is chosen**, decides whether — and which — IP access lists to migrate,
+   from the workspace-wide `enableIpAccessLists` **master toggle**. IP access lists migrate into the
+   new policy's public access **only when enforcement is active**: a list is in effect only if the
+   master toggle is on *and* the list is enabled. Master off ⇒ the lists are **dormant** (not
+   enforced) even if individual lists show `enabled=true`, so they are **not** migrated.
+   - **master on + 1+ rules** → migrate them. (Unreadable toggle → warn + treat as on.)
+   - **master on + 0 rules** → nothing to migrate → **exit** (unless there's front-end PrivateLink).
+   - **master off** → dormant. When there are rules and the run can write (create mode, interactive),
+     it **prints the current config** and **offers to re-enable** enforcement (independent of
+     PrivateLink): **yes** → sets `enableIpAccessLists=true` and migrates the now-active lists; **no**
+     → dormant lists are **not** migrated. `--yes` / propose-only can't re-enable, so they never
+     migrate dormant lists. Front-end PrivateLink (if any) is still migrated and the existing CBI
+     public is **preserved**; if nothing is active at all → **exit**. `--yes` never auto-flips the
+     toggle.
 
-   The "nothing to migrate" exits **don't** apply when the workspace has front-end PrivateLink to
-   migrate (step 3): a PrivateLink-only workspace with public disabled skips the public quadrant
-   entirely, and a 0-rule IP ACL config still proceeds on the private access alone.
+   So the "nothing to migrate" exits also don't fire when there's front-end PrivateLink to migrate
+   (step 2) — a PrivateLink-only / 0-rule workspace still proceeds on the private access alone.
 2. Reads the workspace's IP access lists (`w.ip_access_lists.list()`). **Individual lists that are
    disabled are flagged and NOT migrated** — only enabled lists are; the disabled ones are called out
    in the final printout (below the old + new policy) so you can vet them. Maps **ALLOW lists → allow
