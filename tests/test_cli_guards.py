@@ -1147,6 +1147,14 @@ def test_conflict_gate_allow_all_pas_with_restrictive_private_does_not_abort():
     cli._acl_conflict_gate(a, "p1", will_assign=True)  # must not raise
 
 
+def test_conflict_gate_no_abort_when_public_specs_cleared():
+    # Regression: the conflict gate runs AFTER _acl_ip_gate clears dormant public specs, so an
+    # existing restrictive CBI public must NOT be treated as a public collision when we're not
+    # actually migrating public (allow/deny empty, public enabled). Must not raise.
+    a = _conflict_analysis(allow=[], deny=[], public_enabled=True, ex_public=_restrictive_block())
+    cli._acl_conflict_gate(a, "p1", will_assign=True)
+
+
 def test_conflict_gate_warns_and_proceeds_when_not_assigning(capsys):
     a = _conflict_analysis(allow=[{"x": 1}], ex_public=_restrictive_block())
     cli._acl_conflict_gate(a, "p1", will_assign=False)  # must not raise

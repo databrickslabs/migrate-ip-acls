@@ -1074,7 +1074,7 @@ def _run_acl(cfg: AclConfig, conn: Connection, yes: bool) -> None:
     ws_host = getattr(getattr(wc, "config", None), "host", None)
     cloud = acl_core.workspace_cloud(account, ws_id, host=ws_host, ws=ws_obj)
     # Read the workspace's front-end PrivateLink posture (public toggle + private_access plan), per
-    # cloud, so it can be recreated as-is. GCP PSC aborts here; Azure has nothing to migrate.
+    # cloud, so it can be recreated as-is. AWS/GCP migrate the PAS as-is; Azure has nothing to migrate.
     public_access_enabled, private_plan = _acl_preflight(account, ws_id, cloud=cloud, ws=ws_obj)
 
     # Copy the egress of the policy the workspace currently runs under (its assigned policy, or the
@@ -1102,10 +1102,6 @@ def _run_acl(cfg: AclConfig, conn: Connection, yes: bool) -> None:
     # posture so the builders recreate it as-is, and so the gate doesn't treat a PrivateLink-only
     # workspace (few/no public IP ACLs) as "nothing to migrate".
     analysis = _apply_posture(acl_core.analyze(cfg, wc))
-    # Per-dimension conflict check against any existing assigned CBI policy (public vs private are
-    # independent). Only aborts when assigning AND a legacy source collides with a restrictive block
-    # of the same dimension; otherwise the existing blocks are preserved by build.
-    _acl_conflict_gate(analysis, assigned_id, will_assign=cfg.create_policy and cfg.auto_assign)
     # Decide whether the IP access lists are migrated at all (they are only when enforcement is on,
     # or the user re-enables it here). When not, drop the public specs so dormant lists aren't turned
     # into active public rules — the existing CBI public is preserved instead.
@@ -1128,6 +1124,12 @@ def _run_acl(cfg: AclConfig, conn: Connection, yes: bool) -> None:
             "there are no enabled rules to migrate.",
         )
         raise typer.Exit(code=0)
+    # Per-dimension conflict check against any existing assigned CBI policy (public vs private are
+    # independent). Runs AFTER the migrate decision above, so dormant/cleared public specs aren't
+    # mistaken for a public migration. Only aborts when assigning AND a legacy source we're actually
+    # migrating collides with a restrictive block of the same dimension; otherwise the existing blocks
+    # are preserved by build.
+    _acl_conflict_gate(analysis, assigned_id, will_assign=cfg.create_policy and cfg.auto_assign)
 
     _resolve_policy_name(cfg, conn, wc, yes)
     _ensure_acl_policy_name_unique(cfg, account, ws_id, yes)
@@ -1138,7 +1140,7 @@ def _run_acl(cfg: AclConfig, conn: Connection, yes: bool) -> None:
     # Show the final IP ACL set that will be migrated (reflecting any re-enables) + any front-end
     # PrivateLink being recreated, and confirm, so the step-through pause has context rather than
     # being a bare "continue?" after the params gate.
-    render.acl_current_config(analysis, workspace_enabled=analysis.public_access_enabled)
+    render.acl_current_config(analysis, workspace_enabled=migrate_ip_acls)
     render.acl_private_access(analysis)
     _checkpoint(yes)
 

@@ -238,7 +238,11 @@ def plan_from_pas(pas) -> tuple[bool, PrivateAccessPlan]:
     the workspace's front-end PrivateLink as-is. `public_access_enabled` is the PAS public-internet
     toggle; the plan is the private_access block (ACCOUNT → allow-all-registered, ENDPOINT → the
     enumerated allowed endpoint ids)."""
-    public_enabled = bool(getattr(pas, "public_access_enabled", True))
+    # A PAS object may carry public_access_enabled=None (field present but unset) — getattr returns
+    # None, so the `True` default never applies. Treat unknown as public-ENABLED (the as-is default):
+    # don't infer "PrivateLink-only / deny-all public" from a missing value.
+    pae = getattr(pas, "public_access_enabled", None)
+    public_enabled = True if pae is None else bool(pae)
     level = getattr(pas, "private_access_level", None)
     level_val = str(getattr(level, "value", level) or "").upper()
     pas_id = getattr(pas, "private_access_settings_id", None)

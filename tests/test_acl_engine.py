@@ -496,6 +496,13 @@ def test_plan_from_pas_unspecified_level_defaults_to_allow_all():
     assert plan.restriction_mode == "ALLOW_ALL_REGISTERED_ENDPOINTS"
 
 
+def test_plan_from_pas_public_access_none_defaults_to_enabled():
+    # A PAS with public_access_enabled unset (None) must NOT be read as PrivateLink-only / deny-all;
+    # treat unknown as public-enabled (the as-is default).
+    public, _plan = acl_core.plan_from_pas(_pas(level="ACCOUNT", public=None))
+    assert public is True
+
+
 def test_policy_exists_true_false():
     from databricks.sdk.errors import NotFound
 
