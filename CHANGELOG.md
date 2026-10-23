@@ -14,6 +14,24 @@ commit `vX.Y.Z` — which the release workflow then publishes to PyPI. See
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-23
+
+### Fixed
+
+- **Back-end PrivateLink endpoints are now included in a restricted private policy (AWS / GCP).**
+  When front-end PrivateLink is endpoint-scoped, the generated `private_access` block is
+  `RESTRICTED_ACCESS` — which gates **all** private ingress, not just the front-end. Previously the
+  block was built from the Private Access Settings (front-end) alone, so the workspace's back-end
+  data-plane endpoints (SCC relay + REST) — which live in the network configuration, not the PAS —
+  were left out and the restricted policy blocked the data plane (notebook commands failing
+  "against the workspace's ingress policy"). The migration now reads those back-end endpoints from
+  the workspace's network config (`network.vpc_endpoints`: AWS VPC endpoints / GCP PSC) and adds
+  them as a distinct allow rule alongside the front-end endpoints. Service-direct PrivateLink
+  endpoints, when access is endpoint-restricted, are already carried over verbatim via the PAS, so
+  they need no special handling. A workspace with no back-end PrivateLink (e.g. front-end only, with
+  back-end reaching the control plane via the compute-plane NAT gateway) migrates unchanged, with a
+  note that none was detected.
+
 ## [0.2.0] - 2026-10-21
 
 ### Added
@@ -83,6 +101,7 @@ enrichment.
   working in propose-only mode.
 - **`--version`.** `dbx-migrate-ip-acls --version` reports the tool version.
 
-[Unreleased]: https://github.com/databrickslabs/migrate-ip-acls/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/databrickslabs/migrate-ip-acls/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/databrickslabs/migrate-ip-acls/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/databrickslabs/migrate-ip-acls/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/databrickslabs/migrate-ip-acls/releases/tag/v0.1.0

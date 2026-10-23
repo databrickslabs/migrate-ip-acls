@@ -176,7 +176,13 @@ flowchart TD
    without it a deny-only policy would block everything. On **AWS / GCP**, it also recreates the
    workspace's **front-end PrivateLink** verbatim from its PAS: `private_access_level=ACCOUNT` →
    `ALLOW_ALL_REGISTERED_ENDPOINTS`; `private_access_level=ENDPOINT` → a `RESTRICTED_ACCESS` private
-   rule listing the PAS's registered endpoint ids. When the PAS has **public access disabled**
+   rule listing the PAS's registered endpoint ids. Because a `RESTRICTED_ACCESS` private block gates
+   **all** private ingress (not just the front-end), it also reads the workspace's **back-end
+   PrivateLink** endpoints (data-plane SCC relay + REST) from its network config
+   (`network.vpc_endpoints` — AWS VPC endpoints / GCP PSC; these live in the network config, not the
+   PAS) and adds them as a second allow rule, so the restricted policy doesn't block the data plane.
+   (Service-direct PrivateLink endpoints, when endpoint-restricted, are already in the PAS, so they
+   carry over with the front-end rule.) When the PAS has **public access disabled**
    (PrivateLink-only), the IP access lists aren't in effect, so the `public_access` block is an
    explicit **deny-all** (RESTRICTED_ACCESS, no allow rules) rather than recreating them — public
    ingress stays closed even if the workspace's public toggle is later re-enabled. The PAS itself and

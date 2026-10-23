@@ -132,6 +132,55 @@ def test_build_preserves_existing_public_when_no_ip_acls():
     assert ingress["private_access"]["allow_rules"][0]["origin"]["endpoints"]["endpoint_ids"] == ["el-1"]
 
 
+def test_build_restricted_private_includes_backend_endpoints():
+    # A RESTRICTED_ACCESS private block gates ALL private ingress, so the workspace's back-end
+    # PrivateLink endpoints (relay + REST — not in the PAS) must ride alongside the front-end ones.
+    ws = _FakeWs([], ws_id=7)
+    cfg = AclConfig()
+    a = acl_core.analyze(cfg, ws)
+    a.private_plan = acl_core.PrivateAccessPlan(
+        restriction_mode="RESTRICTED_ACCESS",
+        endpoint_ids=["el-frontend"],
+        label="corp-pas",
+        backend_endpoint_ids=["el-relay", "el-rest"],
+    )
+    priv = acl_core.preview_block(a, cfg)["ingress"]["private_access"]
+    rules = priv["allow_rules"]
+    assert rules[0]["label"] == "corp-pas"  # front-end verbatim
+    assert rules[0]["origin"]["endpoints"]["endpoint_ids"] == ["el-frontend"]
+    # back-end as its own clearly-labelled rule
+    assert rules[1]["label"] == "back-end PrivateLink (data-plane relay + REST)"
+    assert rules[1]["origin"]["endpoints"]["endpoint_ids"] == ["el-relay", "el-rest"]
+
+
+def test_build_backend_endpoints_deduped_against_frontend():
+    # a shared endpoint (in both the PAS and the network config) isn't listed twice
+    ws = _FakeWs([], ws_id=7)
+    cfg = AclConfig()
+    a = acl_core.analyze(cfg, ws)
+    a.private_plan = acl_core.PrivateAccessPlan(
+        restriction_mode="RESTRICTED_ACCESS",
+        endpoint_ids=["el-shared"],
+        label="pas",
+        backend_endpoint_ids=["el-shared", "el-relay"],
+    )
+    rules = acl_core.preview_block(a, cfg)["ingress"]["private_access"]["allow_rules"]
+    assert rules[1]["origin"]["endpoints"]["endpoint_ids"] == ["el-relay"]  # el-shared dropped
+
+
+def test_build_allow_all_private_ignores_backend_endpoints():
+    # ALLOW_ALL_REGISTERED_ENDPOINTS already permits every registered endpoint — no rules added
+    ws = _FakeWs([], ws_id=7)
+    cfg = AclConfig()
+    a = acl_core.analyze(cfg, ws)
+    a.private_plan = acl_core.PrivateAccessPlan(
+        restriction_mode="ALLOW_ALL_REGISTERED_ENDPOINTS", backend_endpoint_ids=["el-relay"]
+    )
+    priv = acl_core.preview_block(a, cfg)["ingress"]["private_access"]
+    assert priv["restriction_mode"] == "ALLOW_ALL_REGISTERED_ENDPOINTS"
+    assert "allow_rules" not in priv
+
+
 def test_build_carries_over_cross_workspace_access():
     from databricks.sdk.service.settings import (  # noqa: I001
         CustomerFacingIngressNetworkPolicyCrossWorkspaceAccess as XWS,
@@ -309,6 +358,52 @@ def _pas(level=None, public=True, ids=None, name=None, pas_id="pas-abc"):
             "allowed_vpc_endpoint_ids": ids,
         },
     )()
+
+
+def _network_account(network_id="net-1", relay=None, rest=None, ws_raises=False, net_raises=False):
+    """An account whose workspace carries `network_id` and whose networks.get returns a Network with
+    vpc_endpoints.{dataplane_relay, rest_api}."""
+
+    class _WS:
+        def get(self, workspace_id):
+            if ws_raises:
+                raise RuntimeError("no perms")
+            return type("W", (), {"network_id": network_id})()
+
+    class _Networks:
+        def get(self, network_id):  # noqa: A002 - mirrors the SDK's positional arg name
+            if net_raises:
+                raise RuntimeError("no perms")
+            vpce = type("V", (), {"dataplane_relay": relay, "rest_api": rest})()
+            return type("N", (), {"vpc_endpoints": vpce})()
+
+    return type("Acct", (), {"workspaces": _WS(), "networks": _Networks()})()
+
+
+def test_backend_private_endpoint_ids_reads_relay_and_rest():
+    acct = _network_account(relay=["el-relay"], rest=["el-rest"])
+    assert acl_core.backend_private_endpoint_ids(acct, 1) == ["el-relay", "el-rest"]
+
+
+def test_backend_private_endpoint_ids_dedupes_preserving_order():
+    acct = _network_account(relay=["el-a", "el-b"], rest=["el-b", "el-c"])
+    assert acl_core.backend_private_endpoint_ids(acct, 1) == ["el-a", "el-b", "el-c"]
+
+
+def test_backend_private_endpoint_ids_no_network_is_empty():
+    # front-end-only PrivateLink (back-end via the compute-plane NAT gateway) → no network id
+    acct = _network_account(network_id=None)
+    assert acl_core.backend_private_endpoint_ids(acct, 1) == []
+
+
+def test_backend_private_endpoint_ids_read_failure_is_empty():
+    assert acl_core.backend_private_endpoint_ids(_network_account(net_raises=True), 1) == []
+    assert acl_core.backend_private_endpoint_ids(_network_account(ws_raises=True), 1) == []
+
+
+def test_backend_private_endpoint_ids_empty_vpc_endpoints_is_empty():
+    acct = _network_account(relay=None, rest=None)
+    assert acl_core.backend_private_endpoint_ids(acct, 1) == []
 
 
 def _cloud_account(cloud, raise_=False):
