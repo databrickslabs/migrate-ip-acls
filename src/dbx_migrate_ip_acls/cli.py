@@ -548,6 +548,25 @@ def _acl_preflight(account, workspace_id, cloud: str | None = None, ws=None):
             "Front-end PrivateLink detected — it will be recreated as-is in the new policy's "
             "private access rules.",
         )
+        # A RESTRICTED_ACCESS (endpoint-scoped) private block gates ALL private ingress, so the
+        # workspace's back-end PrivateLink endpoints (data-plane relay + REST — in the network
+        # config, not the PAS) must be allowed too, or the data plane is blocked. (ALLOW_ALL already
+        # permits every registered endpoint, so there's nothing to add there.)
+        if private_plan.restriction_mode == "RESTRICTED_ACCESS":
+            backend = acl_core.backend_private_endpoint_ids(account, workspace_id, ws=ws)
+            private_plan.backend_endpoint_ids = backend
+            if backend:
+                console.banner(
+                    "info",
+                    f"Detected {len(backend)} back-end PrivateLink endpoint(s) (data-plane relay + "
+                    "REST) for this workspace — including them in the policy's private access so the "
+                    "restricted private rules don't block the data plane.",
+                )
+            else:
+                console.banner(
+                    "warn",
+                    "No back-end PrivateLink endpoint detected for this workspace to migrate.",
+                )
         if not public_access_enabled:
             console.banner(
                 "info",
@@ -591,9 +610,8 @@ def _acl_conflict_gate(analysis, assigned_id: str | None, will_assign: bool) -> 
         console.banner(
             "danger",
             f"This workspace's assigned CBI policy ('{assigned_id}') already has restrictive PUBLIC "
-            "ingress rules, and this migration would also set public access (from the IP access "
-            "lists / public toggle). Migrating public access on top of an existing restrictive CBI "
-            "public policy is NOT supported - aborting.",
+            "ingress rules, and this migration would modify or overwrite them. Migrating public "
+            "access on top of an existing restrictive CBI public policy is NOT supported - aborting.",
         )
         raise typer.Exit(code=1)
 

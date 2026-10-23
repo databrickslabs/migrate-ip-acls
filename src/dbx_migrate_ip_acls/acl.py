@@ -38,6 +38,13 @@ class PrivateAccessPlan:
     endpoint_ids: list[str] = field(default_factory=list)
     label: str = "registered-private-endpoints"
     source_pas_id: str | None = None
+    # The workspace's back-end PrivateLink endpoint ids (data-plane SCC relay + REST), read from its
+    # network configuration — NOT the PAS (which only governs front-end/inbound). A RESTRICTED_ACCESS
+    # private block gates ALL private ingress, so these must be allowed alongside the PAS front-end
+    # endpoints or the data plane is blocked. Empty when the workspace has no back-end PrivateLink
+    # (e.g. front-end PrivateLink only, with back-end egressing via the compute-plane NAT gateway).
+    # Only populated/relevant for a RESTRICTED_ACCESS plan.
+    backend_endpoint_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -259,6 +266,42 @@ def plan_from_pas(pas) -> tuple[bool, PrivateAccessPlan]:
             restriction_mode="ALLOW_ALL_REGISTERED_ENDPOINTS", label=label, source_pas_id=pas_id
         )
     return public_enabled, plan
+
+
+def backend_private_endpoint_ids(account, workspace_id, ws: object | None = None) -> list[str]:
+    """The workspace's back-end PrivateLink endpoint ids — the data-plane SCC relay + REST endpoints
+    registered in its network configuration (`network.vpc_endpoints`: AWS VPC endpoints / GCP PSC
+    endpoints). Unlike the front-end endpoints, these live in the network config, NOT the Private
+    Access Settings (the PAS only governs front-end/inbound). A RESTRICTED_ACCESS CBI private block
+    gates ALL private ingress, so a block built only from the PAS would block the data plane — these
+    must be allowed alongside the PAS front-end endpoints.
+
+    Returns the deduped registered endpoint ids (relay first, then REST), or [] when the workspace
+    has no back-end PrivateLink (e.g. front-end PrivateLink only, with back-end reaching the control
+    plane via the compute-plane NAT gateway) or the read fails. Pass `ws` to reuse an already-fetched
+    workspace object. Best-effort — a read failure degrades to [] rather than crashing."""
+    try:
+        if ws is None:
+            ws = account.workspaces.get(workspace_id=int(workspace_id))
+    except Exception:  # noqa: BLE001 - couldn't read the workspace; treat as no back-end PrivateLink
+        return []
+    network_id = getattr(ws, "network_id", None)
+    if not network_id:
+        return []  # no customer-managed network → no registered back-end endpoints to migrate
+    try:
+        network = account.networks.get(network_id)
+    except Exception:  # noqa: BLE001 - network unreadable; caller notes none were detected
+        return []
+    vpce = getattr(network, "vpc_endpoints", None)
+    if vpce is None:
+        return []
+    relay = list(getattr(vpce, "dataplane_relay", None) or [])
+    rest = list(getattr(vpce, "rest_api", None) or [])
+    out: list[str] = []
+    for ep in relay + rest:
+        if ep and ep not in out:
+            out.append(ep)
+    return out
 
 
 def policy_exists(account, policy_id: str) -> bool:
@@ -512,7 +555,12 @@ def _resolve_private_block(analysis: AclAnalysis, note: Note):
                 "rules rather than loosening them to allow-all."
             )
             return existing
-        return policy.build_private_access_block(plan.restriction_mode, plan.endpoint_ids, plan.label)
+        return policy.build_private_access_block(
+            plan.restriction_mode,
+            plan.endpoint_ids,
+            plan.label,
+            backend_endpoint_ids=plan.backend_endpoint_ids,
+        )
     if existing is not None:
         note(
             "Preserving the workspace's existing CBI private access rules (no front-end PrivateLink "
