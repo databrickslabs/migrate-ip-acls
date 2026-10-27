@@ -121,7 +121,7 @@ def acl_private_access(analysis) -> None:
         # The back-end data-plane endpoints aren't in the PAS; a RESTRICTED_ACCESS block gates all
         # private ingress, so they're added alongside the front-end endpoints (see acl.py).
         detail += (
-            f"; plus {len(backend)} back-end PrivateLink endpoint(s) "
+            f"; plus {len(backend)} back-end private endpoint(s) "
             f"(data-plane relay + REST): {', '.join(backend)}"
         )
     src = f" (from Private Access Settings '{plan.source_pas_id}')" if plan.source_pas_id else ""

@@ -101,7 +101,9 @@ def build_deny_rule(spec: dict, mode_label: str | None):
     )
 
 
-BACKEND_PRIVATE_LABEL = "back-end PrivateLink (data-plane relay + REST)"
+# Cloud-neutral: the same rule is created identically on AWS (PrivateLink), Azure (Private Link) and
+# GCP (Private Service Connect), so the label says "private endpoints" rather than any one cloud's term.
+BACKEND_PRIVATE_LABEL = "back-end private endpoints (data-plane relay + REST)"
 
 
 def build_private_access_block(

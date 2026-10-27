@@ -149,7 +149,7 @@ def test_build_restricted_private_includes_backend_endpoints():
     assert rules[0]["label"] == "corp-pas"  # front-end verbatim
     assert rules[0]["origin"]["endpoints"]["endpoint_ids"] == ["el-frontend"]
     # back-end as its own clearly-labelled rule
-    assert rules[1]["label"] == "back-end PrivateLink (data-plane relay + REST)"
+    assert rules[1]["label"] == "back-end private endpoints (data-plane relay + REST)"
     assert rules[1]["origin"]["endpoints"]["endpoint_ids"] == ["el-relay", "el-rest"]
 
 

@@ -14,6 +14,17 @@ commit `vX.Y.Z` — which the release workflow then publishes to PyPI. See
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-10-27
+
+### Changed
+
+- **Cloud-neutral back-end private-endpoint rule label.** The generated back-end private-access rule
+  is now labelled `back-end private endpoints (data-plane relay + REST)` instead of "back-end
+  PrivateLink …", and the related console messages match. The rule is created identically on all
+  three clouds, where the feature is named differently (AWS PrivateLink, Azure Private Link, GCP
+  Private Service Connect), so the neutral "private endpoints" term is clearer. Label text only — no
+  behaviour change.
+
 ## [0.2.1] - 2026-10-23
 
 ### Fixed
@@ -101,7 +112,8 @@ enrichment.
   working in propose-only mode.
 - **`--version`.** `dbx-migrate-ip-acls --version` reports the tool version.
 
-[Unreleased]: https://github.com/databrickslabs/migrate-ip-acls/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/databrickslabs/migrate-ip-acls/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/databrickslabs/migrate-ip-acls/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/databrickslabs/migrate-ip-acls/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/databrickslabs/migrate-ip-acls/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/databrickslabs/migrate-ip-acls/releases/tag/v0.1.0
