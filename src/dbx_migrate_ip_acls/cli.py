@@ -558,14 +558,14 @@ def _acl_preflight(account, workspace_id, cloud: str | None = None, ws=None):
             if backend:
                 console.banner(
                     "info",
-                    f"Detected {len(backend)} back-end PrivateLink endpoint(s) (data-plane relay + "
+                    f"Detected {len(backend)} back-end private endpoint(s) (data-plane relay + "
                     "REST) for this workspace — including them in the policy's private access so the "
                     "restricted private rules don't block the data plane.",
                 )
             else:
                 console.banner(
                     "warn",
-                    "No back-end PrivateLink endpoint detected for this workspace to migrate.",
+                    "No back-end private endpoint detected for this workspace to migrate.",
                 )
         if not public_access_enabled:
             console.banner(
