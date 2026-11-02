@@ -39,7 +39,7 @@ THEME = Theme(
 
 console = Console(theme=THEME, highlight=False)
 
-# Default cap on rows rendered to the terminal; full data can be written out with --output.
+# Default cap on rows rendered to the terminal, so a very large IP access list stays readable.
 MAX_TABLE_ROWS = 100
 
 # ASCII splash (figlet "small") shown at startup so it's immediately clear which tool is running.
@@ -153,10 +153,7 @@ def dataframe(
         table.add_row(*[_cell(v) for v in row], style=style)
     console.print(table)
     if len(df) > max_rows:
-        console.print(
-            f"[muted]… showing {max_rows:,} of {len(df):,} rows "
-            f"(use --output to write the full result).[/muted]"
-        )
+        console.print(f"[muted]… showing {max_rows:,} of {len(df):,} rows.[/muted]")
 
 
 def _cell(value: Any) -> str:
@@ -180,7 +177,7 @@ def json_panel(title: str, obj: Any) -> None:
 
 @contextmanager
 def status(message: str):
-    """A spinner for a long step (feed download, SQL query, RDAP sweep)."""
+    """A spinner for a long step (an API write, re-enabling lists)."""
     with console.status(f"[info]{message}[/info]", spinner="dots"):
         yield
 

@@ -1,8 +1,8 @@
 """IP ACL → CBI verbatim migration engine.
 
-Ported from `notebooks/ip_acl_migration.py`. Reads this workspace's enabled IP access lists and
-recreates them as a CBI policy as-is (ALLOW → allow rules, BLOCK → deny rules), adding nothing but the
-catch-all allow required when only BLOCK lists exist (CBI is default-deny).
+Reads this workspace's enabled IP access lists and recreates them as a CBI policy as-is (ALLOW →
+allow rules, BLOCK → deny rules), adding nothing but the catch-all allow required when only BLOCK
+lists exist (CBI is default-deny).
 """
 
 from __future__ import annotations
@@ -341,7 +341,7 @@ def public_restrictive(ingress) -> bool:
 
 def private_or_xws_restrictive(ingress) -> bool:
     """True if the ingress block's private_access (PrivateLink) or cross_workspace_access sub-block
-    is restrictive — the parts the public-IP helpers don't build and can't yet preserve."""
+    is restrictive."""
     if ingress is None:
         return False
     return _block_restrictive(getattr(ingress, "private_access", None)) or _block_restrictive(
@@ -415,15 +415,16 @@ def _active_ingress(pol):
 
 
 def existing_cbi_ingress(
-    account, workspace_id
+    account, workspace_id, assigned: tuple[str | None, object | None] | None = None
 ) -> tuple[str | None, object | None, object | None, object | None]:
     """The workspace's currently-assigned CBI policy's ingress sub-blocks, deep-copied so they can be
     preserved verbatim in the generated policy for any dimension this migration doesn't itself
     produce. Returns (assigned_policy_id, public_access, private_access, cross_workspace_access);
     (id, None, None, None) when nothing is assigned / unreadable. Public and private ingress are
     independent — the migration replaces the dimensions it migrates (IP ACLs → public, PAS → private)
-    and copies these blocks for the rest. Best-effort."""
-    policy_id, pol = assigned_policy(account, workspace_id)
+    and copies these blocks for the rest. Pass `assigned` (the result of assigned_policy()) to reuse
+    an already-fetched read instead of repeating it. Best-effort."""
+    policy_id, pol = assigned if assigned is not None else assigned_policy(account, workspace_id)
     if pol is None:
         return policy_id, None, None, None
     ing = _active_ingress(pol)
@@ -443,15 +444,18 @@ def existing_cbi_ingress(
     )
 
 
-def assigned_egress(account, workspace_id) -> tuple[str | None, object | None]:
+def assigned_egress(
+    account, workspace_id, assigned: tuple[str | None, object | None] | None = None
+) -> tuple[str | None, object | None]:
     """The egress block to carry over verbatim to the new policy, so the migration preserves the
     workspace's current egress posture exactly — its enforcement mode, allowed internet (FQDN) and
     storage destinations, and blocked-internet lists. It's the egress of the policy currently
     assigned to the workspace or, when nothing is explicitly assigned, the account baseline
     `default-policy` that governs it by default (both cases replicated identically). Returns
     (source_policy_id, egress); (None, None) when neither is readable, so the caller falls back to a
-    permissive FULL_ACCESS egress. Best-effort, and a deep copy independent of the fetched object."""
-    policy_id, pol = assigned_policy(account, workspace_id)
+    permissive FULL_ACCESS egress. Pass `assigned` (the result of assigned_policy()) to reuse an
+    already-fetched read. Best-effort, and a deep copy independent of the fetched object."""
+    policy_id, pol = assigned if assigned is not None else assigned_policy(account, workspace_id)
     if policy_id:
         # A policy is explicitly assigned (possibly `default-policy` itself). If the policy read
         # failed (pol is None) we can't know its egress — return None so the caller uses FULL_ACCESS

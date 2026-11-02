@@ -454,8 +454,9 @@ def _workspace_id_or_exit(wc) -> int:
 def _confirm_workspace(conn: Connection, yes: bool):
     """Resolve the workspace client and surface exactly which workspace this run reads from and (on
     apply) modifies — profile, URL, id — then gate on Y/N so the target can't be mistaken. Always
-    displays; the confirmation is skipped with --yes and is a no-op non-interactively. Returns the
-    WorkspaceClient (reused by the caller)."""
+    displays; the confirmation is skipped with --yes and is a no-op non-interactively. Returns
+    `(WorkspaceClient, workspace_id)` — the id is resolved once here (with a clean error on failure)
+    and reused by the caller rather than fetched again."""
     import sys
 
     wc = _workspace_client_or_exit(conn)
@@ -467,32 +468,23 @@ def _confirm_workspace(conn: Connection, yes: bool):
     # otherwise fail deep inside get_workspace_id with a raw JSONDecodeError — catch it up front.
     if _looks_like_account_console(host):
         _account_profile_as_workspace_error(host)
-    try:
-        ws_id = wc.get_workspace_id()
-    except Exception:  # noqa: BLE001
-        ws_id = "unknown"
+    ws_id = _workspace_id_or_exit(wc)
     console.workspace_panel(conn.profile or "env / OAuth", host, ws_id)
     if yes or not sys.stdin.isatty():
-        return wc
+        return wc, ws_id
     if not typer.confirm(typer.style("Is this the correct workspace to migrate?", fg="yellow"), default=True):
         console.banner("info", "Aborted — re-run with the intended --profile.")
         raise typer.Exit(code=0)
-    return wc
+    return wc, ws_id
 
 
-def _resolve_policy_name(cfg, conn: Connection, wc, yes: bool) -> None:
+def _resolve_policy_name(cfg, conn: Connection, ws_id, yes: bool) -> None:
     """Resolve the policy name once. An explicit --policy-name is kept as-is; otherwise prompt for
     one (blank = the profile name, falling back to the workspace id). Mutates cfg.policy_name."""
     import sys
 
     if cfg.policy_name:
         return
-    if getattr(getattr(cfg, "apply", None), "policy_action", "create_new") == "add_to_existing":
-        return
-    try:
-        ws_id = wc.get_workspace_id()
-    except Exception:  # noqa: BLE001
-        ws_id = None
     default = conn.profile or (str(ws_id) if ws_id is not None else DEFAULT_NAME_PREFIX)
     if yes or not sys.stdin.isatty():
         cfg.policy_name = default
@@ -1056,7 +1048,7 @@ def _run_acl(cfg: AclConfig, conn: Connection, yes: bool) -> None:
     console.title_panel(
         "IP Access List → CBI migration", "Migrate this workspace's IP ACL to a new CBI policy."
     )
-    wc = _confirm_workspace(conn, yes)
+    wc, ws_id = _confirm_workspace(conn, yes)
     # Point account-level calls at the account console matching the workspace's environment (unless
     # --account-host was pinned), so a staging / GCP / Azure workspace doesn't fail against the AWS
     # prod default.
@@ -1069,7 +1061,6 @@ def _run_acl(cfg: AclConfig, conn: Connection, yes: bool) -> None:
     # table or prompting about disabled lists. That way an unsupported workspace (PrivateLink) or an
     # existing enforced CBI policy fails fast, instead of after the user has scrolled the ACL table,
     # picked disabled rules, and entered an account_id.
-    ws_id = _workspace_id_or_exit(wc)
     # Default the account_id from the workspace profile (so it needn't be retyped / mis-typed), then
     # prompt only if still unknown.
     _default_account_id_from_workspace(conn, wc)
@@ -1098,11 +1089,12 @@ def _run_acl(cfg: AclConfig, conn: Connection, yes: bool) -> None:
     # Copy the egress of the policy the workspace currently runs under (its assigned policy, or the
     # account default-policy when nothing is assigned) into the new policy, so its egress posture is
     # preserved verbatim rather than reset to FULL_ACCESS. None → nothing readable → FULL_ACCESS.
-    egress_source, existing_egress = acl_core.assigned_egress(account, ws_id)
+    assigned = acl_core.assigned_policy(account, ws_id)  # read once; shared by both readers below
+    egress_source, existing_egress = acl_core.assigned_egress(account, ws_id, assigned=assigned)
     # The workspace's existing assigned CBI policy's ingress sub-blocks — preserved verbatim for any
     # dimension this migration doesn't itself produce (public and private are independent).
     assigned_id, existing_public, existing_private, existing_xws = acl_core.existing_cbi_ingress(
-        account, ws_id
+        account, ws_id, assigned=assigned
     )
 
     def _apply_posture(a):
@@ -1149,7 +1141,7 @@ def _run_acl(cfg: AclConfig, conn: Connection, yes: bool) -> None:
     # are preserved by build.
     _acl_conflict_gate(analysis, assigned_id, will_assign=cfg.create_policy and cfg.auto_assign)
 
-    _resolve_policy_name(cfg, conn, wc, yes)
+    _resolve_policy_name(cfg, conn, ws_id, yes)
     _ensure_acl_policy_name_unique(cfg, account, ws_id, yes)
     render.acl_decisions(cfg)
     _note_policy_name(cfg.policy_name)

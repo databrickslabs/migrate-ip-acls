@@ -550,8 +550,8 @@ def test_confirm_workspace_yes_displays_and_does_not_prompt(monkeypatch, capsys)
     monkeypatch.setattr(
         "typer.confirm", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not prompt with --yes"))
     )
-    wc = cli._confirm_workspace(Connection(profile="myprof"), yes=True)
-    assert isinstance(wc, _FakeWsClient)
+    wc, ws_id = cli._confirm_workspace(Connection(profile="myprof"), yes=True)
+    assert isinstance(wc, _FakeWsClient) and ws_id == 12345
     out = capsys.readouterr().out
     # the panel must surface all three so the target is unmistakable
     assert "12345" in out and "ws.cloud.databricks.com" in out and "myprof" in out
@@ -781,19 +781,15 @@ def test_resolve_policy_name_keeps_explicit():
     from dbx_migrate_ip_acls.config import AclConfig, Connection
 
     cfg = AclConfig(policy_name="chosen")
-    cli._resolve_policy_name(cfg, Connection(profile="p"), object(), yes=True)
+    cli._resolve_policy_name(cfg, Connection(profile="p"), 42, yes=True)
     assert cfg.policy_name == "chosen"
 
 
 def test_resolve_policy_name_uses_profile_when_blank_and_noninteractive():
     from dbx_migrate_ip_acls.config import AclConfig, Connection
 
-    class _WC:
-        def get_workspace_id(self):
-            return 42
-
     cfg = AclConfig()
-    cli._resolve_policy_name(cfg, Connection(profile="myprof"), _WC(), yes=True)
+    cli._resolve_policy_name(cfg, Connection(profile="myprof"), 42, yes=True)
     assert cfg.policy_name == "myprof"  # blank -> profile name (no prompt under --yes)
 
 

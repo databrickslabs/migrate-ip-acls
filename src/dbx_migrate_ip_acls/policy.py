@@ -233,7 +233,10 @@ def build_ingress_block(
     public = build_public_access_block(allow, deny, mode_label, note, public_enabled)
     private = (
         build_private_access_block(
-            private_plan.restriction_mode, private_plan.endpoint_ids, private_plan.label
+            private_plan.restriction_mode,
+            private_plan.endpoint_ids,
+            private_plan.label,
+            backend_endpoint_ids=getattr(private_plan, "backend_endpoint_ids", None),
         )
         if private_plan is not None
         else None
