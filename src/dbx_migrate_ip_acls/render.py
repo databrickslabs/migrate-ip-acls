@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from . import acl, console
+from . import acl, console, policy
 from .config import AclConfig
 
 
@@ -17,7 +17,12 @@ def acl_decisions(cfg: AclConfig) -> None:
     console.decisions_panel(
         "IP ACL → CBI migration configuration",
         [
-            ("policy_mode", cfg.policy_mode, "enforce (default) or dry_run."),
+            (
+                "policy_mode",
+                cfg.policy_mode,
+                "enforce (default) or dry_run. Inherited from the workspace's existing CBI policy when "
+                "that policy has restrictive rules.",
+            ),
             ("policy_name", cfg.policy_name, "Policy id for the new policy (from --policy-name / prompt)."),
             ("auto_assign", cfg.auto_assign, "Bind this workspace to the new policy."),
             (
@@ -86,9 +91,9 @@ def acl_disabled_notice(analysis) -> None:
 
 
 def acl_private_access(analysis) -> None:
-    """Show what the generated policy's private_access will be — the front-end PrivateLink migrated
-    from the PAS, or the workspace's existing CBI private rules preserved verbatim. Nothing is shown
-    when there's neither."""
+    """Show what the generated policy's private_access will be — the legacy private posture migrated
+    from the PAS (or deny-all when no PAS is attached on AWS / GCP), or the workspace's existing CBI
+    private rules preserved verbatim. Nothing is shown when there's neither."""
     plan = getattr(analysis, "private_plan", None)
     existing_private = getattr(analysis, "existing_private", None)
     if plan is None:
@@ -101,7 +106,7 @@ def acl_private_access(analysis) -> None:
                 "in the JSON preview below.",
             )
         return
-    console.rule("Front-end PrivateLink → private access")
+    console.rule("Legacy private access → private access")
     if plan.restriction_mode == "ALLOW_ALL_REGISTERED_ENDPOINTS" and acl.block_restrictive(existing_private):
         console.banner(
             "info",
@@ -113,17 +118,22 @@ def acl_private_access(analysis) -> None:
     if plan.restriction_mode == "ALLOW_ALL_REGISTERED_ENDPOINTS":
         detail = "all registered private endpoints (ALLOW_ALL_REGISTERED_ENDPOINTS)"
     elif plan.endpoint_ids:
-        detail = f"RESTRICTED_ACCESS — selected endpoints: {', '.join(plan.endpoint_ids)}"
+        detail = f"RESTRICTED_ACCESS — '{plan.label}': {', '.join(plan.endpoint_ids)}"
     else:
-        detail = "RESTRICTED_ACCESS — no registered endpoints permitted"
+        detail = "RESTRICTED_ACCESS — no front-end private endpoints permitted"
     backend = getattr(plan, "backend_endpoint_ids", None)
     if backend:
-        # The back-end data-plane endpoints aren't in the PAS; a RESTRICTED_ACCESS block gates all
-        # private ingress, so they're added alongside the front-end endpoints (see acl.py).
-        detail += (
-            f"; plus {len(backend)} back-end private endpoint(s) "
-            f"(data-plane relay + REST): {', '.join(backend)}"
+        # The back-end REST API endpoint isn't in the PAS; a RESTRICTED_ACCESS block gates all private
+        # ingress, so it's added as its own rule alongside the front-end endpoints (see acl.py).
+        detail += f"; plus '{policy.BACKEND_PRIVATE_LABEL}': {', '.join(backend)}"
+    if not getattr(plan, "from_pas", True):
+        console.banner(
+            "info",
+            "No Private Access Settings are attached to this workspace, so no private endpoint can "
+            f"reach it today — recreated as-is in the policy's private access: {detail}. Review it "
+            "alongside the JSON preview below.",
         )
+        return
     src = f" (from Private Access Settings '{plan.source_pas_id}')" if plan.source_pas_id else ""
     console.banner(
         "info",

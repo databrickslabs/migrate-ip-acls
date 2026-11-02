@@ -498,20 +498,26 @@ def _resolve_policy_name(cfg, conn: Connection, ws_id, yes: bool) -> None:
 
 
 def _acl_preflight(account, workspace_id, cloud: str | None = None, ws=None):
-    """Read the workspace's front-end PrivateLink posture to fold into the migration, per cloud.
-    Returns `(public_access_enabled, private_plan)` — `private_plan` is None when there's no
-    PrivateLink to migrate. The per-dimension conflict check against any existing assigned CBI policy
+    """Read the workspace's legacy private-access posture to fold into the migration, per cloud.
+    Returns `(public_access_enabled, private_plan)` — `private_plan` is None when there's nothing to
+    migrate for private. The per-dimension conflict check against any existing assigned CBI policy
     happens later, in `_acl_conflict_gate`.
 
-    Per cloud (front-end PrivateLink source of truth):
+    Per cloud (legacy private access source of truth):
     * AWS / GCP — read the workspace's Private Access Settings (PAS); on GCP front-end PrivateLink is
       Private Service Connect (PSC), surfaced through the same PAS object. If attached, migrate it
       as-is into the new policy's private_access block (its public toggle + endpoint scope) — the
-      mapping is cloud-agnostic. No PAS → public only.
+      mapping is cloud-agnostic. **No PAS → no private endpoint can reach the workspace**, so that is
+      migrated as-is too: a RESTRICTED_ACCESS private block with no front-end endpoints (leaving the
+      block out would default CBI to allow-all-registered — a loosening). Whenever the plan is
+      RESTRICTED_ACCESS, the workspace's back-end (classic compute) REST API endpoint is read from its
+      network config and allowed as a second rule, since the restricted block gates ALL private ingress.
     * Azure — there's nothing to migrate: Azure front-end PrivateLink uses Azure Private Endpoints
       (not a PAS), and context-based ingress allows `databricks_ui_api` endpoints by default, so the
       workspace's existing private connectivity keeps working with no private_access rules. The public
-      network-access toggle isn't being retired either. So Azure migrates its IP access lists only."""
+      network-access toggle isn't being retired either. So Azure migrates its IP access lists only.
+    * Unknown cloud — the PAS is still read and migrated when present, but the no-PAS → deny-all
+      mapping is NOT applied (it's only known to hold on AWS / GCP); a warning says so."""
     from . import acl as acl_core
 
     public_access_enabled, private_plan = True, None
@@ -540,32 +546,53 @@ def _acl_preflight(account, workspace_id, cloud: str | None = None, ws=None):
             "Front-end PrivateLink detected — it will be recreated as-is in the new policy's "
             "private access rules.",
         )
-        # A RESTRICTED_ACCESS (endpoint-scoped) private block gates ALL private ingress, so the
-        # workspace's back-end PrivateLink endpoints (data-plane relay + REST — in the network
-        # config, not the PAS) must be allowed too, or the data plane is blocked. (ALLOW_ALL already
-        # permits every registered endpoint, so there's nothing to add there.)
-        if private_plan.restriction_mode == "RESTRICTED_ACCESS":
-            backend = acl_core.backend_private_endpoint_ids(account, workspace_id, ws=ws)
-            private_plan.backend_endpoint_ids = backend
-            if backend:
-                console.banner(
-                    "info",
-                    f"Detected {len(backend)} back-end private endpoint(s) (data-plane relay + "
-                    "REST) for this workspace — including them in the policy's private access so the "
-                    "restricted private rules don't block the data plane.",
-                )
-            else:
-                console.banner(
-                    "warn",
-                    "No back-end private endpoint detected for this workspace to migrate.",
-                )
         if not public_access_enabled:
             console.banner(
                 "info",
                 "Public network access is disabled on this workspace (PrivateLink-only) — the "
                 "generated policy denies all public ingress.",
             )
-    # status == "none": no PAS attached — no front-end PrivateLink to migrate (public only).
+    elif cloud in ("aws", "gcp"):
+        # status == "none": no PAS attached. A PAS is required for any PrivateLink / PSC connectivity,
+        # so today no private endpoint can reach this workspace — recreate that as a deny-all private
+        # block rather than leaving private access to the CBI default (allow all registered endpoints).
+        private_plan = acl_core.plan_without_pas()
+        console.banner(
+            "info",
+            "No Private Access Settings are attached to this workspace, so no private endpoint can "
+            "reach it today — the generated policy recreates that as-is: private access "
+            "RESTRICTED_ACCESS with no front-end endpoints.",
+        )
+    else:
+        # status == "none" on a cloud we couldn't determine: the no-PAS → deny-all mapping is only
+        # known to hold on AWS / GCP, so don't apply it blind.
+        console.banner(
+            "warn",
+            "Couldn't determine this workspace's cloud and it has no Private Access Settings attached "
+            "— private access is NOT migrated (on AWS / GCP that would be a deny-all private block). "
+            "Verify the generated policy's private access before relying on it.",
+        )
+
+    # A RESTRICTED_ACCESS private block gates ALL private ingress, so the workspace's back-end
+    # (classic compute) REST API endpoint — registered in the network config, not the PAS — must be
+    # allowed too, or classic compute can't reach the workspace API. (ALLOW_ALL already permits every
+    # registered endpoint, so there's nothing to add there.)
+    if private_plan is not None and private_plan.restriction_mode == "RESTRICTED_ACCESS":
+        backend = acl_core.backend_private_endpoint_ids(account, workspace_id, ws=ws)
+        private_plan.backend_endpoint_ids = backend
+        if backend:
+            console.banner(
+                "info",
+                f"Detected {len(backend)} classic compute REST API endpoint(s) in this workspace's "
+                "network configuration — including them in the policy's private access so the "
+                "restricted private rules don't block classic compute.",
+            )
+        else:
+            console.banner(
+                "info",
+                "No classic compute REST API endpoint found in this workspace's network configuration "
+                "(no back-end PrivateLink) — nothing to add for it.",
+            )
     return public_access_enabled, private_plan
 
 
@@ -578,8 +605,10 @@ def _acl_conflict_gate(analysis, assigned_id: str | None, will_assign: bool) -> 
 
       * public  → abort if we're migrating public (IP access lists, or the PAS public toggle) AND the
         assigned CBI policy's public_access is restrictive;
-      * private → abort if we're migrating a *non-allow-all* PAS (endpoint-scoped) AND the assigned
-        CBI policy's private_access is restrictive.
+      * private → abort if we're migrating a *restrictive* legacy private posture (an endpoint-scoped
+        PAS, or no PAS at all on AWS / GCP) AND the assigned CBI policy's private_access is
+        restrictive. An account-level (allow-all) PAS never collides — the stricter existing CBI
+        private rules are kept instead.
 
     When NOT assigning, the binding is untouched, so we only note that the existing policy stays."""
     from . import acl as acl_core
@@ -610,14 +639,56 @@ def _acl_conflict_gate(analysis, assigned_id: str | None, will_assign: bool) -> 
     plan = analysis.private_plan
     migrating_restrictive_private = plan is not None and plan.restriction_mode == "RESTRICTED_ACCESS"
     if migrating_restrictive_private and priv_restrictive:
+        source = (
+            "endpoint-scoped front-end PrivateLink"
+            if plan.from_pas
+            else "the absence of Private Access Settings, i.e. no private endpoints"
+        )
         console.banner(
             "danger",
             f"This workspace's assigned CBI policy ('{assigned_id}') already has restrictive PRIVATE "
-            "ingress rules, and this migration would also set private access (from endpoint-scoped "
-            "front-end PrivateLink). Migrating private access on top of an existing restrictive CBI "
-            "private policy is NOT supported - aborting.",
+            f"ingress rules, and this migration would also set private access (from {source}). "
+            "Migrating private access on top of an existing restrictive CBI private policy is NOT "
+            "supported - aborting.",
         )
         raise typer.Exit(code=1)
+
+
+def _inherit_policy_mode(cfg: AclConfig, analysis, assigned_id: str | None, assigned_policy) -> None:
+    """A network policy supports a single enforcement mode. When the workspace's existing assigned
+    CBI policy has restrictive ingress rules in any dimension (public / private / cross-workspace),
+    the generated policy carries those rules over, so it must keep their mode: dry-run rules can't be
+    silently promoted to enforced, nor enforced rules demoted to dry run. So the existing policy's
+    mode wins over --policy-mode (with a warning when they differ). And when the inherited mode is
+    dry run, --disable-existing-ip-acls is ignored — a dry-run policy blocks nothing, so the legacy
+    IP access lists must stay on. When the existing policy has no restrictive ingress (nothing
+    assigned, or an allow-all baseline), --policy-mode applies as given. Mutates cfg."""
+    from . import acl as acl_core
+
+    dims = ("existing_public", "existing_private", "existing_xws")
+    carried = any(getattr(analysis, k, None) is not None for k in dims)
+    if not carried:
+        return
+    mode = acl_core.assigned_ingress_mode(assigned_policy)
+    if mode is None:
+        return
+    if mode != cfg.policy_mode:
+        console.banner(
+            "warn",
+            f"The workspace's existing CBI policy ('{assigned_id}') has restrictive ingress rules in "
+            f"{'dry-run' if mode == 'dry_run' else 'enforced'} mode, and its rules are carried into the "
+            f"new policy — so the new policy is created in {mode} mode too. --policy-mode "
+            f"{cfg.policy_mode} is ignored (a policy has a single enforcement mode).",
+        )
+        cfg.policy_mode = mode
+    if mode == "dry_run" and cfg.disable_existing_ip_acls:
+        console.banner(
+            "warn",
+            "--disable-existing-ip-acls is ignored: the new policy inherits dry-run mode from the "
+            "existing CBI policy, and a dry-run policy blocks nothing, so the workspace's IP access "
+            "lists stay enabled.",
+        )
+        cfg.disable_existing_ip_acls = False
 
 
 def _confirm_overwrite(dest, yes: bool) -> bool:
@@ -870,7 +941,7 @@ def _acl_ip_gate(analysis, wc, yes: bool, create_policy: bool = True) -> bool:
     # toggle is True or None (unknown) — treat as enforced.
     if total == 0:
         if has_private:
-            return True  # no public IP ACLs, but there's front-end PrivateLink to migrate
+            return True  # no public IP ACLs, but there's legacy private access to migrate
         console.banner(
             "info", "This workspace's IP access lists have no rules. There is nothing to " "migrate."
         )
@@ -1082,8 +1153,9 @@ def _run_acl(cfg: AclConfig, conn: Connection, yes: bool) -> None:
     # anyway — it has no PAS and no back-end network config).
     ws_host = getattr(getattr(wc, "config", None), "host", None)
     cloud = acl_core.workspace_cloud(account, ws_id, host=ws_host, ws=ws_obj)
-    # Read the workspace's front-end PrivateLink posture (public toggle + private_access plan), per
-    # cloud, so it can be recreated as-is. AWS/GCP migrate the PAS as-is; Azure has nothing to migrate.
+    # Read the workspace's legacy private-access posture (public toggle + private_access plan), per
+    # cloud, so it can be recreated as-is. AWS/GCP migrate the PAS (or its absence = deny-all) as-is;
+    # Azure has nothing to migrate.
     public_access_enabled, private_plan = _acl_preflight(account, ws_id, cloud=cloud, ws=ws_obj)
 
     # Copy the egress of the policy the workspace currently runs under (its assigned policy, or the
@@ -1140,6 +1212,9 @@ def _run_acl(cfg: AclConfig, conn: Connection, yes: bool) -> None:
     # migrating collides with a restrictive block of the same dimension; otherwise the existing blocks
     # are preserved by build.
     _acl_conflict_gate(analysis, assigned_id, will_assign=cfg.create_policy and cfg.auto_assign)
+    # Rules carried over from the existing CBI policy keep their enforcement mode — the generated
+    # policy inherits it (and can't disable the IP ACLs if that mode is dry run).
+    _inherit_policy_mode(cfg, analysis, assigned_id, assigned[1])
 
     _resolve_policy_name(cfg, conn, ws_id, yes)
     _ensure_acl_policy_name_unique(cfg, account, ws_id, yes)

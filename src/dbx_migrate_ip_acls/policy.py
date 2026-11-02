@@ -101,9 +101,13 @@ def build_deny_rule(spec: dict, mode_label: str | None):
     )
 
 
-# Cloud-neutral: the same rule is created identically on AWS (PrivateLink), Azure (Private Link) and
-# GCP (Private Service Connect), so the label says "private endpoints" rather than any one cloud's term.
-BACKEND_PRIVATE_LABEL = "back-end private endpoints (data-plane relay + REST)"
+# Fixed labels for the two private-access allow rules this tool generates (agreed with the CBI
+# product team). Cloud-neutral: the rules are created identically on AWS (PrivateLink) and GCP
+# (Private Service Connect).
+#   * INBOUND_PRIVATE_LABEL — the front-end endpoints migrated from the Private Access Settings;
+#   * BACKEND_PRIVATE_LABEL — the classic-compute (back-end) REST API endpoint from the network config.
+INBOUND_PRIVATE_LABEL = "Inbound private endpoints"
+BACKEND_PRIVATE_LABEL = "Classic compute REST API endpoint"
 
 
 def build_private_access_block(
@@ -116,10 +120,10 @@ def build_private_access_block(
 
     * ALLOW_ALL_REGISTERED_ENDPOINTS → the mode alone (any registered endpoint; no explicit rules).
     * RESTRICTED_ACCESS → one allow rule whose origin lists the PAS front-end endpoint ids, PLUS a
-      second allow rule for the workspace's back-end PrivateLink endpoints (`backend_endpoint_ids` —
-      the data-plane SCC relay + REST, which live in the network config, not the PAS). A
-      RESTRICTED_ACCESS block gates ALL private ingress, so without the back-end endpoints it would
-      block the data plane. With no ids at all (an endpoint-scoped PAS that allows nothing, and no
+      second allow rule for the workspace's back-end (classic compute) REST API endpoint
+      (`backend_endpoint_ids` — registered in the network config, not the PAS). A RESTRICTED_ACCESS
+      block gates ALL private ingress, so without the REST API endpoint it would block classic
+      compute. With no ids at all (no PAS, or an endpoint-scoped PAS that allows nothing, and no
       back-end PrivateLink) the block is RESTRICTED_ACCESS with no allow rules — faithfully, no
       private endpoint is permitted."""
     from databricks.sdk.service.settings import (  # noqa: I001
@@ -144,8 +148,8 @@ def build_private_access_block(
     rules = []
     if endpoint_ids:
         rules.append(_rule(label, list(endpoint_ids)))
-    # Back-end endpoints aren't in the PAS; a RESTRICTED_ACCESS block built from the PAS alone would
-    # block them. Add them as a distinct, clearly-labelled rule, deduped against the front-end set.
+    # The back-end REST API endpoint isn't in the PAS; a RESTRICTED_ACCESS block built from the PAS
+    # alone would block it. Add it as a distinct, clearly-labelled rule, deduped against the front-end set.
     front = set(endpoint_ids or [])
     backend = [e for e in (backend_endpoint_ids or []) if e not in front]
     if backend:

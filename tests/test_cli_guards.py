@@ -936,9 +936,47 @@ def test_privatelink_only_workspace_exports_private_access(monkeypatch, tmp_path
     ingress = data["ingress"]
     # front-end PrivateLink migrated as-is (endpoint-scoped), public denied (PrivateLink-only)
     assert ingress["private_access"]["allow_rules"][0]["origin"]["endpoints"]["endpoint_ids"] == ["el-1"]
-    assert ingress["private_access"]["allow_rules"][0]["label"] == "corp-pas"
+    assert ingress["private_access"]["allow_rules"][0]["label"] == "Inbound private endpoints"
     assert ingress["public_access"]["restriction_mode"] == "RESTRICTED_ACCESS"
     assert "allow_rules" not in ingress["public_access"]
+
+
+def test_no_pas_aws_workspace_exports_deny_all_private(monkeypatch, tmp_path):
+    # AWS workspace with IP ACLs but NO Private Access Settings: public is migrated from the lists, and
+    # private is recreated as-is as deny-all (no PAS = no private endpoint can reach the workspace).
+    import json
+
+    import dbx_migrate_ip_acls.auth as auth
+
+    monkeypatch.setattr(auth, "workspace_client", lambda conn: _AclWorkspace())
+    monkeypatch.setattr(auth, "account_client", lambda conn: _CleanAclAccount())
+    out = tmp_path / "nopas.json"
+    args = ["--profile", "t", "--account-id", "a", "--export", str(out)]
+    result = runner.invoke(cli.app, [*args, "--no-create-policy", "--no-auto-assign", "--yes"])
+    assert result.exit_code == 0, result.output
+    ingress = json.loads(out.read_text())["ingress"]
+    assert ingress["public_access"]["allow_rules"][0]["label"] == "office"
+    assert ingress["private_access"]["restriction_mode"] == "RESTRICTED_ACCESS"
+    assert "allow_rules" not in ingress["private_access"]  # no front-end ids, no back-end PrivateLink
+    assert "noprivateendpointcanreach" in _squash(result.output).lower()
+
+
+def test_no_pas_no_acl_aws_workspace_still_migrates_private(monkeypatch, tmp_path):
+    # No PAS AND no IP access lists: there's still a legacy private posture (deny-all) to migrate on
+    # AWS/GCP, so the run must NOT exit as "nothing to migrate".
+    import json
+
+    import dbx_migrate_ip_acls.auth as auth
+
+    monkeypatch.setattr(auth, "workspace_client", lambda conn: _PLWorkspace())  # no lists, toggle off
+    monkeypatch.setattr(auth, "account_client", lambda conn: _CleanAclAccount())  # no PAS
+    out = tmp_path / "nopas-noacl.json"
+    args = ["--profile", "t", "--account-id", "a", "--export", str(out)]
+    result = runner.invoke(cli.app, [*args, "--no-create-policy", "--no-auto-assign", "--yes"])
+    assert result.exit_code == 0, result.output
+    ingress = json.loads(out.read_text())["ingress"]
+    assert ingress["private_access"]["restriction_mode"] == "RESTRICTED_ACCESS"
+    assert "public_access" not in ingress  # no IP ACLs to migrate, nothing existing to preserve
 
 
 def test_export_writes_json_and_terraform(monkeypatch, tmp_path):
@@ -1007,14 +1045,24 @@ def test_export_writes_utf8_non_ascii_labels(tmp_path):
     assert loaded["ingress"]["public_access"]["allow_rules"][0]["label"] == "café-café"
 
 
-def _patch_pas(monkeypatch, status="none", pas=object(), plan=None, public=True):
-    """Stub read_workspace_pas (and plan_from_pas when a PAS is returned) for preflight tests."""
+def _patch_pas(monkeypatch, status="none", pas=object(), plan=None, public=True, backend=()):
+    """Stub read_workspace_pas (and plan_from_pas when a PAS is returned) plus the back-end REST API
+    endpoint read for preflight tests."""
     from dbx_migrate_ip_acls.acl import PrivateAccessPlan
 
     monkeypatch.setattr("dbx_migrate_ip_acls.acl.read_workspace_pas", lambda a, w, ws=None: (pas, status))
     plan = plan or PrivateAccessPlan(restriction_mode="ALLOW_ALL_REGISTERED_ENDPOINTS", source_pas_id="p")
     monkeypatch.setattr("dbx_migrate_ip_acls.acl.plan_from_pas", lambda p: (public, plan))
+    monkeypatch.setattr(
+        "dbx_migrate_ip_acls.acl.backend_private_endpoint_ids", lambda a, w, ws=None: list(backend)
+    )
     return plan
+
+
+def _assert_deny_all_private(plan, backend=()):
+    assert plan is not None and plan.restriction_mode == "RESTRICTED_ACCESS"
+    assert plan.endpoint_ids == [] and plan.from_pas is False
+    assert plan.backend_endpoint_ids == list(backend)
 
 
 def test_acl_preflight_aws_pas_is_migrated_not_aborted(monkeypatch, capsys):
@@ -1032,9 +1080,50 @@ def test_acl_preflight_aws_public_disabled_notes_privatelink_only(monkeypatch, c
     assert "public network access is disabled" in capsys.readouterr().out.lower()
 
 
-def test_acl_preflight_aws_no_pas_is_public_only(monkeypatch):
+def test_acl_preflight_aws_no_pas_is_deny_all_private(monkeypatch, capsys):
+    # No PAS on AWS = no private endpoint can reach the workspace -> recreated as a deny-all private
+    # block (NOT "nothing to migrate"), public left enabled.
     _patch_pas(monkeypatch, status="none")
-    assert cli._acl_preflight(object(), 42, cloud="aws") == (True, None)
+    public_enabled, plan = cli._acl_preflight(object(), 42, cloud="aws")
+    assert public_enabled is True
+    _assert_deny_all_private(plan)
+    assert "no private access settings" in capsys.readouterr().out.lower()
+
+
+def test_acl_preflight_aws_no_pas_includes_backend_rest_endpoint(monkeypatch, capsys):
+    # ... but the classic-compute REST API endpoint from the network config is still allowed.
+    _patch_pas(monkeypatch, status="none", backend=["el-rest"])
+    _public, plan = cli._acl_preflight(object(), 42, cloud="aws")
+    _assert_deny_all_private(plan, backend=["el-rest"])
+    assert "classic compute rest api endpoint" in capsys.readouterr().out.lower()
+
+
+def test_acl_preflight_endpoint_pas_includes_backend_rest_endpoint(monkeypatch):
+    from dbx_migrate_ip_acls.acl import PrivateAccessPlan
+
+    plan = PrivateAccessPlan(restriction_mode="RESTRICTED_ACCESS", endpoint_ids=["el-fe"], source_pas_id="p")
+    _patch_pas(monkeypatch, status="ok", plan=plan, backend=["el-rest"])
+    _public, out = cli._acl_preflight(object(), 42, cloud="aws")
+    assert out is plan and out.backend_endpoint_ids == ["el-rest"]
+
+
+def test_acl_preflight_allow_all_pas_skips_backend_read(monkeypatch):
+    # ALLOW_ALL already permits every registered endpoint — the network config isn't consulted.
+    called = {"n": 0}
+    _patch_pas(monkeypatch, status="ok")
+    monkeypatch.setattr(
+        "dbx_migrate_ip_acls.acl.backend_private_endpoint_ids",
+        lambda a, w, ws=None: called.__setitem__("n", called["n"] + 1) or [],
+    )
+    _public, plan = cli._acl_preflight(object(), 42, cloud="aws")
+    assert plan.restriction_mode == "ALLOW_ALL_REGISTERED_ENDPOINTS" and called["n"] == 0
+
+
+def test_acl_preflight_unknown_cloud_no_pas_does_not_apply_deny_all(monkeypatch, capsys):
+    # The no-PAS -> deny-all mapping is only known to hold on AWS / GCP; unknown cloud -> warn, no plan.
+    _patch_pas(monkeypatch, status="none")
+    assert cli._acl_preflight(object(), 42, cloud=None) == (True, None)
+    assert "couldn't determine" in capsys.readouterr().out.lower()
 
 
 def test_acl_preflight_gcp_pas_is_migrated(monkeypatch, capsys):
@@ -1045,15 +1134,12 @@ def test_acl_preflight_gcp_pas_is_migrated(monkeypatch, capsys):
     assert "front-end privatelink detected" in capsys.readouterr().out.lower()
 
 
-def test_acl_preflight_gcp_no_pas_proceeds(monkeypatch):
-    # A GCP workspace with no PAS has no front-end PSC — migrate the IP access lists only.
+def test_acl_preflight_gcp_no_pas_is_deny_all_private(monkeypatch):
+    # GCP uses the same PAS object for PSC, so no PAS maps identically: deny-all private.
     _patch_pas(monkeypatch, status="none")
-    assert cli._acl_preflight(object(), 42, cloud="gcp") == (True, None)
-
-
-def test_acl_preflight_passes_when_clean(monkeypatch):
-    _patch_pas(monkeypatch, status="none")
-    assert cli._acl_preflight(object(), 42, cloud="aws") == (True, None)
+    public_enabled, plan = cli._acl_preflight(object(), 42, cloud="gcp")
+    assert public_enabled is True
+    _assert_deny_all_private(plan)
 
 
 def test_acl_preflight_warns_but_proceeds_when_pas_unreadable(monkeypatch, capsys):
@@ -1134,6 +1220,25 @@ def test_conflict_gate_private_collision_aborts_for_endpoint_scoped_pas():
     assert e.value.exit_code == 1
 
 
+def test_conflict_gate_no_pas_plan_collides_with_restrictive_private():
+    # no PAS (deny-all private) over an existing restrictive CBI private block -> abort when assigning
+    import typer
+
+    from dbx_migrate_ip_acls.acl import plan_without_pas
+
+    a = _conflict_analysis(allow=[{"x": 1}], plan=plan_without_pas(), ex_private=_restrictive_block())
+    with pytest.raises(typer.Exit) as e:
+        cli._acl_conflict_gate(a, "p1", will_assign=True)
+    assert e.value.exit_code == 1
+
+
+def test_conflict_gate_no_pas_plan_without_existing_private_proceeds():
+    from dbx_migrate_ip_acls.acl import plan_without_pas
+
+    a = _conflict_analysis(allow=[{"x": 1}], plan=plan_without_pas(), ex_public=None, ex_private=None)
+    cli._acl_conflict_gate(a, "p1", will_assign=True)  # must not raise
+
+
 def test_conflict_gate_allow_all_pas_with_restrictive_private_does_not_abort():
     # allow-all PAS + restrictive existing CBI private -> no abort (build preserves the stricter rules)
     from dbx_migrate_ip_acls.acl import PrivateAccessPlan
@@ -1155,6 +1260,60 @@ def test_conflict_gate_warns_and_proceeds_when_not_assigning(capsys):
     a = _conflict_analysis(allow=[{"x": 1}], ex_public=_restrictive_block())
     cli._acl_conflict_gate(a, "p1", will_assign=False)  # must not raise
     assert "isn'tassigning" in _squash(capsys.readouterr().out)
+
+
+# --- mode inheritance from the existing assigned CBI policy -----------------------------------
+def _policy_with_mode(mode):
+    """A fake assigned policy whose restrictive public rules live in `ingress` (enforce) or
+    `ingress_dry_run` (dry_run)."""
+    ing = type("Ing", (), {"public_access": _restrictive_block(), "private_access": None})()
+    blocks = (
+        {"ingress": ing, "ingress_dry_run": None}
+        if mode == "enforce"
+        else {"ingress": None, "ingress_dry_run": ing}
+    )
+    return type("P", (), blocks)()
+
+
+def test_inherit_policy_mode_dry_run_existing_overrides_enforce_and_disable(capsys):
+    from dbx_migrate_ip_acls.config import AclConfig
+
+    cfg = AclConfig(policy_mode="enforce", disable_existing_ip_acls=True, create_policy=True)
+    a = _conflict_analysis(allow=[{"x": 1}], ex_private=_restrictive_block())  # private carried over
+    cli._inherit_policy_mode(cfg, a, "p1", _policy_with_mode("dry_run"))
+    assert cfg.policy_mode == "dry_run"
+    assert cfg.disable_existing_ip_acls is False  # a dry-run policy blocks nothing -> ACLs stay on
+    out = _squash(capsys.readouterr().out).lower()
+    assert "--policy-modeenforceisignored" in out and "--disable-existing-ip-aclsisignored" in out
+
+
+def test_inherit_policy_mode_enforce_existing_overrides_dry_run(capsys):
+    from dbx_migrate_ip_acls.config import AclConfig
+
+    cfg = AclConfig(policy_mode="dry_run")
+    a = _conflict_analysis(allow=[], ex_public=_restrictive_block())  # public carried over
+    cli._inherit_policy_mode(cfg, a, "p1", _policy_with_mode("enforce"))
+    assert cfg.policy_mode == "enforce"
+    assert "ignored" in capsys.readouterr().out.lower()
+
+
+def test_inherit_policy_mode_same_mode_is_silent(capsys):
+    from dbx_migrate_ip_acls.config import AclConfig
+
+    cfg = AclConfig(policy_mode="enforce", disable_existing_ip_acls=True)
+    a = _conflict_analysis(allow=[{"x": 1}], ex_private=_restrictive_block())
+    cli._inherit_policy_mode(cfg, a, "p1", _policy_with_mode("enforce"))
+    assert cfg.policy_mode == "enforce" and cfg.disable_existing_ip_acls is True
+    assert capsys.readouterr().out == ""
+
+
+def test_inherit_policy_mode_noop_when_nothing_restrictive_exists():
+    # nothing assigned / allow-all baseline -> --policy-mode applies as given
+    from dbx_migrate_ip_acls.config import AclConfig
+
+    cfg = AclConfig(policy_mode="dry_run")
+    cli._inherit_policy_mode(cfg, _conflict_analysis(allow=[{"x": 1}]), None, None)
+    assert cfg.policy_mode == "dry_run"
 
 
 def _wc_host(host):

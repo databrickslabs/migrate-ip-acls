@@ -25,25 +25,31 @@ DEFAULT_POLICY_ID = "default-policy"
 
 @dataclass
 class PrivateAccessPlan:
-    """The workspace's front-end PrivateLink, recreated as-is in the CBI `private_access` block.
-
-    Derived from the workspace's Private Access Settings (PAS):
-    * `private_access_level=ACCOUNT`  → restriction_mode ALLOW_ALL_REGISTERED_ENDPOINTS (any
-      registered endpoint; no explicit rules);
-    * `private_access_level=ENDPOINT` → restriction_mode RESTRICTED_ACCESS with one allow rule
-      listing the PAS's `allowed_vpc_endpoint_ids` (the Databricks-registered endpoint ids).
-    The label is the PAS name (verbatim) when it has one, else a generic fallback."""
+    """The workspace's legacy private access (AWS / GCP), recreated as-is in the CBI `private_access`
+    block. On these clouds a workspace can only be reached over PrivateLink / PSC through a Private
+    Access Settings (PAS) object, so the legacy private posture always exists:
+    * PAS with `private_access_level=ACCOUNT`  → ALLOW_ALL_REGISTERED_ENDPOINTS (any registered
+      endpoint; no explicit rules);
+    * PAS with `private_access_level=ENDPOINT` → RESTRICTED_ACCESS with one allow rule listing the
+      PAS's `allowed_vpc_endpoint_ids` (the Databricks-registered endpoint ids);
+    * no PAS attached → no private endpoint can reach the workspace → RESTRICTED_ACCESS with no
+      front-end endpoints (`from_pas=False`).
+    The front-end rule carries the fixed label INBOUND_PRIVATE_LABEL."""
 
     restriction_mode: str  # "ALLOW_ALL_REGISTERED_ENDPOINTS" | "RESTRICTED_ACCESS"
     endpoint_ids: list[str] = field(default_factory=list)
-    label: str = "registered-private-endpoints"
+    label: str = policy.INBOUND_PRIVATE_LABEL
     source_pas_id: str | None = None
-    # The workspace's back-end PrivateLink endpoint ids (data-plane SCC relay + REST), read from its
-    # network configuration — NOT the PAS (which only governs front-end/inbound). A RESTRICTED_ACCESS
-    # private block gates ALL private ingress, so these must be allowed alongside the PAS front-end
-    # endpoints or the data plane is blocked. Empty when the workspace has no back-end PrivateLink
-    # (e.g. front-end PrivateLink only, with back-end egressing via the compute-plane NAT gateway).
-    # Only populated/relevant for a RESTRICTED_ACCESS plan.
+    # False when the plan was derived from the ABSENCE of a PAS (deny-all private) rather than from
+    # a PAS object — used only to word the console output.
+    from_pas: bool = True
+    # The workspace's back-end (classic compute) REST API endpoint ids, read from its network
+    # configuration (`network.vpc_endpoints.rest_api`) — NOT the PAS (which only governs
+    # front-end/inbound). In the legacy model these are implicitly allowed alongside the PAS
+    # endpoints, and a RESTRICTED_ACCESS private block gates ALL private ingress, so they must be
+    # allowed explicitly or classic compute can't reach the REST API. The SCC relay endpoint isn't
+    # workspace-API ingress, so it isn't included. Empty when the workspace has no back-end
+    # PrivateLink. Only relevant for a RESTRICTED_ACCESS plan.
     backend_endpoint_ids: list[str] = field(default_factory=list)
 
 
@@ -60,8 +66,9 @@ class AclAnalysis:
     # by the CLI after analyze() rather than by analyze() itself:
     #   * public_access_enabled — the PAS public-internet toggle (default True = no PAS / public on).
     #     When False (PrivateLink-only), the generated public_access block is an explicit deny-all.
-    #   * private_plan — the PAS mapped to a CBI private_access block, or None when there's no
-    #     front-end PrivateLink to migrate.
+    #   * private_plan — the legacy private posture mapped to a CBI private_access block (from the
+    #     PAS, or deny-all when no PAS is attached on AWS / GCP), or None when there's nothing to
+    #     migrate for private (Azure, or an unreadable PAS).
     public_access_enabled: bool = True
     private_plan: PrivateAccessPlan | None = None
     # The workspace's existing assigned CBI policy's ingress sub-blocks (deep-copied), preserved
@@ -220,11 +227,12 @@ def workspace_cloud(account, workspace_id, host: str | None = None, ws: object |
 def read_workspace_pas(account, workspace_id, ws: object | None = None) -> tuple[object | None, str]:
     """Fetch the workspace's Private Access Settings (PAS) object — the source of truth for AWS/GCP
     front-end PrivateLink. Returns (pas, status) where status is:
-      * 'none'  — no PAS attached (the workspace has no front-end PrivateLink; migrate public only);
+      * 'none'  — no PAS attached (on AWS / GCP that means no private endpoint can reach the
+                   workspace — see plan_without_pas());
       * 'ok'    — PAS read (`pas` is the object to map into a private_access block);
       * 'error' — the account read failed (caller warns; PrivateLink can't be migrated).
-    Separating 'none' from 'error' matters: a workspace with genuinely no PrivateLink must migrate
-    cleanly, while an unreadable account must warn rather than silently drop a private rule. Pass `ws`
+    Separating 'none' from 'error' matters: a workspace with genuinely no PAS maps to a deny-all
+    private block, while an unreadable account must warn rather than silently produce one. Pass `ws`
     to reuse an already-fetched workspace object (e.g. from verify_account_access). Best-effort."""
     try:
         if ws is None:
@@ -253,8 +261,8 @@ def plan_from_pas(pas) -> tuple[bool, PrivateAccessPlan]:
     level = getattr(pas, "private_access_level", None)
     level_val = str(getattr(level, "value", level) or "").upper()
     pas_id = getattr(pas, "private_access_settings_id", None)
-    # Keep the PAS name as the rule label verbatim (nothing added); fall back when it has none.
-    label = getattr(pas, "private_access_settings_name", None) or "registered-private-endpoints"
+    # The front-end rule carries a fixed, agreed label (the PAS name is still shown in the console).
+    label = policy.INBOUND_PRIVATE_LABEL
     if level_val == "ENDPOINT":
         ids = list(getattr(pas, "allowed_vpc_endpoint_ids", None) or [])
         plan = PrivateAccessPlan(
@@ -268,18 +276,31 @@ def plan_from_pas(pas) -> tuple[bool, PrivateAccessPlan]:
     return public_enabled, plan
 
 
-def backend_private_endpoint_ids(account, workspace_id, ws: object | None = None) -> list[str]:
-    """The workspace's back-end PrivateLink endpoint ids — the data-plane SCC relay + REST endpoints
-    registered in its network configuration (`network.vpc_endpoints`: AWS VPC endpoints / GCP PSC
-    endpoints). Unlike the front-end endpoints, these live in the network config, NOT the Private
-    Access Settings (the PAS only governs front-end/inbound). A RESTRICTED_ACCESS CBI private block
-    gates ALL private ingress, so a block built only from the PAS would block the data plane — these
-    must be allowed alongside the PAS front-end endpoints.
+def plan_without_pas() -> PrivateAccessPlan:
+    """The private_access plan for an AWS / GCP workspace with NO Private Access Settings attached.
 
-    Returns the deduped registered endpoint ids (relay first, then REST), or [] when the workspace
-    has no back-end PrivateLink (e.g. front-end PrivateLink only, with back-end reaching the control
-    plane via the compute-plane NAT gateway) or the read fails. Pass `ws` to reuse an already-fetched
-    workspace object. Best-effort — a read failure degrades to [] rather than crashing."""
+    A PAS is required for any PrivateLink / PSC connectivity to a workspace, so without one no
+    private endpoint can reach it — the legacy private posture is "no endpoints", not "unconfigured".
+    Recreating that faithfully is a RESTRICTED_ACCESS block with no front-end endpoints (the caller
+    still folds in any back-end REST API endpoint from the network config). Leaving the block out
+    instead would default CBI private access to allow-all-registered — a loosening."""
+    return PrivateAccessPlan(restriction_mode="RESTRICTED_ACCESS", from_pas=False)
+
+
+def backend_private_endpoint_ids(account, workspace_id, ws: object | None = None) -> list[str]:
+    """The workspace's back-end (classic compute) REST API endpoint ids — registered in its network
+    configuration (`network.vpc_endpoints.rest_api`: AWS VPC endpoints / GCP PSC endpoints). Unlike
+    the front-end endpoints, these live in the network config, NOT the Private Access Settings (the
+    PAS only governs front-end/inbound). In the legacy model the allowed private endpoints are the PAS
+    endpoints OR the network config's REST API endpoint, and a RESTRICTED_ACCESS CBI private block
+    gates ALL private ingress — so a block built only from the PAS would block classic compute. The
+    SCC relay endpoint (`dataplane_relay`) is deliberately NOT included: it carries the cluster
+    tunnel, not workspace-API ingress, so the ingress policy never evaluates it.
+
+    Returns the deduped REST API endpoint ids, or [] when the workspace has no back-end PrivateLink
+    (e.g. front-end PrivateLink only, with back-end reaching the control plane via the compute-plane
+    NAT gateway) or the read fails. Pass `ws` to reuse an already-fetched workspace object.
+    Best-effort — a read failure degrades to [] rather than crashing."""
     try:
         if ws is None:
             ws = account.workspaces.get(workspace_id=int(workspace_id))
@@ -295,10 +316,8 @@ def backend_private_endpoint_ids(account, workspace_id, ws: object | None = None
     vpce = getattr(network, "vpc_endpoints", None)
     if vpce is None:
         return []
-    relay = list(getattr(vpce, "dataplane_relay", None) or [])
-    rest = list(getattr(vpce, "rest_api", None) or [])
     out: list[str] = []
-    for ep in relay + rest:
+    for ep in getattr(vpce, "rest_api", None) or []:
         if ep and ep not in out:
             out.append(ep)
     return out
@@ -399,6 +418,21 @@ def assigned_policy(account, workspace_id) -> tuple[str | None, object | None]:
         return policy_id, account.network_policies.get_network_policy_rpc(network_policy_id=policy_id)
     except Exception:  # noqa: BLE001
         return policy_id, None
+
+
+def assigned_ingress_mode(pol) -> str | None:
+    """The enforcement mode of a policy's ingress rules — "enforce" when its restrictive rules live
+    in `ingress`, "dry_run" when they live in `ingress_dry_run`, None when the policy has no
+    restrictive ingress (or is None). A network policy supports a single enforcement mode, so rules
+    carried over from it into the generated policy must keep this mode — putting dry-run rules in an
+    enforced block (or vice versa) would silently change what they do."""
+    ing = getattr(pol, "ingress", None)
+    if ing is not None and _ingress_restrictive(ing):
+        return "enforce"
+    dry = getattr(pol, "ingress_dry_run", None)
+    if dry is not None and _ingress_restrictive(dry):
+        return "dry_run"
+    return None
 
 
 def _active_ingress(pol):
