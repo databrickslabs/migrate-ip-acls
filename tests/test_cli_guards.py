@@ -1262,6 +1262,61 @@ def test_conflict_gate_warns_and_proceeds_when_not_assigning(capsys):
     assert "isn'tassigning" in _squash(capsys.readouterr().out)
 
 
+# --- assigned-policy read failure must fail closed --------------------------------------------
+def _unreadable_state():
+    from dbx_migrate_ip_acls.acl import AssignedPolicy
+
+    return AssignedPolicy(policy_id=None, policy=None, read_error="workspace network option: X: 503")
+
+
+def test_assigned_policy_unreadable_aborts_create_and_assign(capsys):
+    import typer
+
+    from dbx_migrate_ip_acls.config import AclConfig
+
+    cfg = AclConfig(create_policy=True, auto_assign=True)
+    with pytest.raises(typer.Exit) as e:
+        cli._assigned_policy_unreadable(_unreadable_state(), cfg)
+    assert e.value.exit_code == 1
+    out = _squash(capsys.readouterr().out).lower()
+    assert "willnotcreate+assign" in out and "503" in out
+
+
+def test_assigned_policy_unreadable_warns_for_propose_only_and_create_only(capsys):
+    from dbx_migrate_ip_acls.config import AclConfig
+
+    cli._assigned_policy_unreadable(_unreadable_state(), AclConfig(create_policy=False, auto_assign=False))
+    cli._assigned_policy_unreadable(_unreadable_state(), AclConfig(create_policy=True, auto_assign=False))
+    out = _squash(capsys.readouterr().out).lower()
+    assert out.count("couldn'treadthenetworkpolicy") == 2 and "assumesnothingisassigned" in out
+
+
+def test_run_aborts_before_any_write_when_assigned_policy_unreadable(monkeypatch, capsys):
+    # End-to-end: the account's network-option read keeps failing -> create+assign run exits 1 and
+    # never reaches policy creation.
+    import dbx_migrate_ip_acls.auth as auth
+
+    class _Acct(_CleanAclAccount):
+        class _WNC:
+            def get_workspace_network_option_rpc(self, workspace_id):
+                raise RuntimeError("503 upstream")
+
+        workspace_network_configuration = _WNC()
+        created = []
+
+        class _NP(_CleanAclAccount._NP):
+            def create_network_policy_rpc(self, network_policy):
+                raise AssertionError("must not create a policy when the assigned policy is unreadable")
+
+        network_policies = _NP()
+
+    monkeypatch.setattr(auth, "workspace_client", lambda conn: _AclWorkspace())
+    monkeypatch.setattr(auth, "account_client", lambda conn: _Acct())
+    result = runner.invoke(cli.app, ["--profile", "t", "--account-id", "a", "--yes"])
+    assert result.exit_code == 1, result.output
+    assert "willnotcreate+assign" in _squash(result.output).lower()
+
+
 # --- mode inheritance from the existing assigned CBI policy -----------------------------------
 def _policy_with_mode(mode):
     """A fake assigned policy whose restrictive public rules live in `ingress` (enforce) or

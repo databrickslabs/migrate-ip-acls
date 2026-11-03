@@ -740,6 +740,64 @@ def test_assigned_ingress_mode_reads_where_the_restrictive_rules_live():
     assert acl_core.assigned_ingress_mode(None) is None
 
 
+def _flaky_policy_account(assigned_policy_id, policy_obj, option_failures=0, policy_failures=0):
+    """Like _policy_account, but the first `option_failures` network-option reads and the first
+    `policy_failures` policy reads raise (transient account-API errors)."""
+    calls = {"opt": 0, "pol": 0}
+
+    class _WNC:
+        def get_workspace_network_option_rpc(self, workspace_id):
+            calls["opt"] += 1
+            if calls["opt"] <= option_failures:
+                raise RuntimeError("503 upstream")
+            return type("O", (), {"network_policy_id": assigned_policy_id})()
+
+    class _NP:
+        def get_network_policy_rpc(self, network_policy_id):
+            calls["pol"] += 1
+            if calls["pol"] <= policy_failures:
+                raise RuntimeError("503 upstream")
+            return policy_obj
+
+    acct = type("Acct", (), {"workspace_network_configuration": _WNC(), "network_policies": _NP()})()
+    return acct, calls
+
+
+def test_assigned_policy_state_unassigned_is_not_an_error():
+    s = acl_core.assigned_policy_state(_policy_account(None, None), 42)
+    assert (s.policy_id, s.policy, s.read_error) == (None, None, None)
+
+
+def test_assigned_policy_state_retries_a_transient_option_failure():
+    pol = object()
+    acct, calls = _flaky_policy_account("p1", pol, option_failures=1)
+    s = acl_core.assigned_policy_state(acct, 42)
+    assert (s.policy_id, s.policy, s.read_error) == ("p1", pol, None)
+    assert calls["opt"] == 2  # failed once, succeeded on the retry
+
+
+def test_assigned_policy_state_reports_persistent_option_failure():
+    acct, calls = _flaky_policy_account("p1", object(), option_failures=5)
+    s = acl_core.assigned_policy_state(acct, 42)
+    assert s.policy is None and s.policy_id is None
+    assert s.read_error and "workspace network option" in s.read_error and "503" in s.read_error
+    assert calls["opt"] == 2  # exactly one retry
+
+
+def test_assigned_policy_state_reports_policy_read_failure_with_id():
+    acct, calls = _flaky_policy_account("p1", object(), policy_failures=5)
+    s = acl_core.assigned_policy_state(acct, 42)
+    assert s.policy_id == "p1" and s.policy is None
+    assert s.read_error and "network policy 'p1'" in s.read_error
+    assert calls["pol"] == 2
+
+
+def test_assigned_policy_wrapper_keeps_best_effort_shape():
+    # the legacy tuple view degrades silently (used by tests/readers); the CLI uses the state object
+    acct, _ = _flaky_policy_account("p1", object(), option_failures=5)
+    assert acl_core.assigned_policy(acct, 42) == (None, None)
+
+
 def test_existing_cbi_ingress_none_when_unassigned():
     assert acl_core.existing_cbi_ingress(_policy_account(None, None), 42) == (None, None, None, None)
 

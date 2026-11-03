@@ -402,22 +402,52 @@ def egress_enforced(egress) -> bool:
     return str(getattr(mode, "value", mode) or "") == "ENFORCED"
 
 
+@dataclass
+class AssignedPolicy:
+    """The workspace's currently-assigned network policy, with the read outcome made explicit.
+
+    `read_error` is None when the read succeeded — including the legitimate "nothing assigned" case
+    (`policy_id` None). It carries a short description when the assignment or the policy itself
+    could NOT be read. The distinction matters: a failed read must never be mistaken for "nothing
+    assigned", because the conflict gate, mode inheritance and egress copy all key off this object,
+    and a create+assign run would otherwise replace a restrictive policy it never saw."""
+
+    policy_id: str | None = None
+    policy: object | None = None
+    read_error: str | None = None
+
+
+def assigned_policy_state(account, workspace_id, retries: int = 1) -> AssignedPolicy:
+    """Read the workspace's assigned network policy fail-closed: retry transient failures once, and
+    report a read failure explicitly (`read_error`) instead of degrading to "nothing assigned". The
+    CLI refuses to create + assign on a read error and only warns in propose-only mode."""
+    last_err: str | None = None
+    policy_id: str | None = None
+    for _attempt in range(retries + 1):
+        try:
+            opt = account.workspace_network_configuration.get_workspace_network_option_rpc(
+                workspace_id=int(workspace_id)
+            )
+        except Exception as e:  # noqa: BLE001 - retried, then reported
+            last_err = f"workspace network option: {type(e).__name__}: {str(e)[:200]}"
+            continue
+        policy_id = getattr(opt, "network_policy_id", None)
+        if not policy_id:
+            return AssignedPolicy()  # genuinely nothing assigned
+        try:
+            pol = account.network_policies.get_network_policy_rpc(network_policy_id=policy_id)
+            return AssignedPolicy(policy_id, pol, None)
+        except Exception as e:  # noqa: BLE001 - retried, then reported
+            last_err = f"network policy '{policy_id}': {type(e).__name__}: {str(e)[:200]}"
+    return AssignedPolicy(policy_id, None, last_err)
+
+
 def assigned_policy(account, workspace_id) -> tuple[str | None, object | None]:
     """(assigned_policy_id, full policy object) for the workspace — (id, None) if the policy read
-    failed, (None, None) if nothing is assigned. Best-effort."""
-    try:
-        opt = account.workspace_network_configuration.get_workspace_network_option_rpc(
-            workspace_id=int(workspace_id)
-        )
-        policy_id = getattr(opt, "network_policy_id", None)
-    except Exception:  # noqa: BLE001
-        return None, None
-    if not policy_id:
-        return None, None
-    try:
-        return policy_id, account.network_policies.get_network_policy_rpc(network_policy_id=policy_id)
-    except Exception:  # noqa: BLE001
-        return policy_id, None
+    failed, (None, None) if nothing is assigned or the assignment couldn't be read. Best-effort
+    view over assigned_policy_state(); the CLI uses that directly so a read failure is surfaced."""
+    state = assigned_policy_state(account, workspace_id)
+    return state.policy_id, state.policy
 
 
 def assigned_ingress_mode(pol) -> str | None:

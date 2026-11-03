@@ -654,6 +654,32 @@ def _acl_conflict_gate(analysis, assigned_id: str | None, will_assign: bool) -> 
         raise typer.Exit(code=1)
 
 
+def _assigned_policy_unreadable(state, cfg: AclConfig) -> None:
+    """The assigned-policy read failed (after a retry). Everything downstream — the per-dimension
+    conflict gate, mode inheritance and the egress copy — keys off that read, so treating the failure
+    as "nothing assigned" could let a create + assign silently replace a restrictive policy or flip
+    its enforcement mode. Fail closed: abort when this run would assign; otherwise warn and continue
+    (a propose-only / create-only run replaces nothing, but its preview can't account for the
+    existing policy)."""
+    detail = state.read_error
+    if cfg.create_policy and cfg.auto_assign:
+        console.banner(
+            "danger",
+            f"Couldn't read the network policy currently assigned to this workspace ({detail}). "
+            "Assigning a new policy without knowing the existing one could silently replace restrictive "
+            "rules or change their enforcement mode, so this run will NOT create + assign. Re-run "
+            "(account-API errors can be transient), or run propose-only with --no-create-policy "
+            "--no-auto-assign.",
+        )
+        raise typer.Exit(code=1)
+    console.banner(
+        "warn",
+        f"Couldn't read the network policy currently assigned to this workspace ({detail}). The "
+        "conflict check, enforcement-mode inheritance and egress copy are skipped — the preview "
+        "assumes nothing is assigned. Don't create a policy from it without a successful re-run.",
+    )
+
+
 def _inherit_policy_mode(cfg: AclConfig, analysis, assigned_id: str | None, assigned_policy) -> None:
     """A network policy supports a single enforcement mode. When the workspace's existing assigned
     CBI policy has restrictive ingress rules in any dimension (public / private / cross-workspace),
@@ -1161,7 +1187,12 @@ def _run_acl(cfg: AclConfig, conn: Connection, yes: bool) -> None:
     # Copy the egress of the policy the workspace currently runs under (its assigned policy, or the
     # account default-policy when nothing is assigned) into the new policy, so its egress posture is
     # preserved verbatim rather than reset to FULL_ACCESS. None → nothing readable → FULL_ACCESS.
-    assigned = acl_core.assigned_policy(account, ws_id)  # read once; shared by both readers below
+    # Read the assigned policy once (fail-closed: a read failure is NOT "nothing assigned" — it aborts a
+    # create + assign run, see _assigned_policy_unreadable) and share it with both readers below.
+    state = acl_core.assigned_policy_state(account, ws_id)
+    if state.read_error:
+        _assigned_policy_unreadable(state, cfg)
+    assigned = (state.policy_id, state.policy)
     egress_source, existing_egress = acl_core.assigned_egress(account, ws_id, assigned=assigned)
     # The workspace's existing assigned CBI policy's ingress sub-blocks — preserved verbatim for any
     # dimension this migration doesn't itself produce (public and private are independent).

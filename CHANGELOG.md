@@ -45,6 +45,12 @@ commit `vX.Y.Z` — which the release workflow then publishes to PyPI. See
 
 ### Fixed
 
+- **A failed read of the workspace's assigned policy no longer passes as "nothing assigned".** The
+  conflict gate, enforcement-mode inheritance and egress copy all depend on that read; previously any
+  error was swallowed and the run proceeded as if no policy were assigned, so a transient account-API
+  failure could let a create + assign silently replace a restrictive policy. The read is now retried
+  once and, if it still fails, a run that would **assign** aborts with a clear message; propose-only
+  and create-only runs continue with a warning that the preview can't account for the existing policy.
 - Removed an unreachable branch and stale references left over from the sibling tool; the workspace
   id and the assigned network policy are each read once per run instead of twice. No behaviour change.
 
