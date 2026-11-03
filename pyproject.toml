@@ -4,7 +4,7 @@ name = "databricks-migrate-ip-acls"
 # tagging the commit `vX.Y.Z`, which release.yml then publishes to PyPI. Between tags the build
 # reports a PEP 440 dev version (e.g. 0.1.1.dev3+g<sha>). Never hardcode it here.
 dynamic = ["version"]
-description = "Migrate a Databricks workspace's existing IP access list into a context-based ingress (CBI) account network policy, verbatim — a focused, review-gated CLI."
+description = "Migrate a Databricks workspace's existing IP access list — and, on AWS / GCP, its legacy private access (PrivateLink / PSC) — into a context-based ingress (CBI) account network policy, verbatim — a focused, review-gated CLI."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE.md" }

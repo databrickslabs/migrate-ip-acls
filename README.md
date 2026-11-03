@@ -63,7 +63,7 @@ flowchart LR
 
     WSC -->|"read IP access lists +<br/>enableIpAccessLists toggle"| WAPI["Databricks<br/>Workspace API"]
     ENG -. builds policy .-> ACC
-    ACC -->|"pre-checks: assigned policy ·<br/>read Private Access Settings ·<br/>create + assign"| AAPI["Databricks<br/>Account API"]
+    ACC -->|"pre-checks: assigned policy (fail-closed) ·<br/>Private Access Settings · network config<br/>(back-end REST endpoint) · create + assign"| AAPI["Databricks<br/>Account API"]
     EXP -. writes .-> FILES[["&lt;policy-id&gt;.json<br/>&lt;policy-id&gt;.tf"]]
 
     classDef you fill:#e2e3e5,stroke:#6c757d,color:#111
@@ -85,7 +85,10 @@ flowchart TD
     A(["dbx-migrate-ip-acls"]) --> B{"Confirm target workspace?"}
     B -->|no| X1["Abort — nothing written"]
     B -->|yes| ACCT["Account access (prompt account_id) · pre-checks"]
-    ACCT --> PL{"Legacy private access? (per cloud)"}
+    ACCT --> RDP{"Assigned CBI policy readable?<br/>(retried once)"}
+    RDP -->|"no — assigning"| X7["ABORT — can't tell what it would replace"]
+    RDP -->|"no — propose-only / create-only:<br/>warn, preview assumes nothing assigned"| PL
+    RDP -->|yes| PL{"Legacy private access? (per cloud)"}
     PL -->|"AWS / GCP: PAS attached<br/>(GCP = PSC, same PAS object)"| PLM["Read PAS → migrate private access as-is<br/>(public toggle + endpoint scope)"]
     PL -->|"Azure"| PLZ["Nothing to migrate (Azure PEs allowed by CBI<br/>by default) — migrate IP ACLs only"]
     PL -->|"AWS / GCP: no PAS attached"| PLN["No private endpoint can reach the workspace →<br/>private access RESTRICTED_ACCESS, no front-end endpoints<br/>(+ classic compute REST API endpoint, if any)"]
@@ -128,7 +131,7 @@ flowchart TD
     classDef done fill:#e2e3e5,stroke:#6c757d,color:#111
     classDef write fill:#d1e7dd,stroke:#146c43,color:#111
     classDef warn fill:#fff3cd,stroke:#997404,color:#111
-    class X3 stop
+    class X3,X7 stop
     class X1,X4,X5,X6,DONE done
     class WD,WE,ASB,DISB write
     class REEN,MODE warn
@@ -138,8 +141,11 @@ flowchart TD
 
 1. **Right after the workspace is chosen** — and *before* the IP access lists are read or shown —
    runs account-level **pre-checks**, so an unsupported or already-migrated workspace fails fast. It
-   prompts for the `account_id` if it wasn't passed, then resolves the workspace's **legacy private
-   access** per cloud by reading its **Private Access Settings (PAS)**:
+   prompts for the `account_id` if it wasn't passed, reads the workspace's **currently-assigned CBI
+   policy** (fail-closed: the read is retried once and, if it still fails, a run that would assign
+   **aborts** rather than treating the failure as "nothing assigned"; propose-only continues with a
+   warning), then resolves the workspace's **legacy private access** per cloud by reading its
+   **Private Access Settings (PAS)**:
    - **AWS / GCP** — a PAS attached is **migrated as-is** into the new policy's `private_access` block
      (see step 3). On GCP, front-end PrivateLink is Private Service Connect (PSC), surfaced through the
      same PAS object, so it maps identically (the mapping is cloud-agnostic). **No PAS attached** is

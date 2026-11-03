@@ -14,6 +14,10 @@ commit `vX.Y.Z` — which the release workflow then publishes to PyPI. See
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-03
+
+Behaviour changes agreed with the CBI product team; flag surface unchanged (minor bump).
+
 ### Changed
 
 - **No Private Access Settings (AWS / GCP) is migrated as deny-all private access.** A PAS is
@@ -152,7 +156,8 @@ enrichment.
   working in propose-only mode.
 - **`--version`.** `dbx-migrate-ip-acls --version` reports the tool version.
 
-[Unreleased]: https://github.com/databrickslabs/migrate-ip-acls/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/databrickslabs/migrate-ip-acls/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/databrickslabs/migrate-ip-acls/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/databrickslabs/migrate-ip-acls/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/databrickslabs/migrate-ip-acls/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/databrickslabs/migrate-ip-acls/compare/v0.1.0...v0.2.0

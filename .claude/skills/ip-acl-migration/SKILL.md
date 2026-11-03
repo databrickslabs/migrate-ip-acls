@@ -22,7 +22,9 @@ IP ACL as CBI, or create a network policy from the current ACL without analysing
 `uv sync`, then `uv run dbx-migrate-ip-acls …` (or `uv tool install .` then `dbx-migrate-ip-acls …`).
 Auth is the SDK's unified auth (`--profile` or `DATABRICKS_*`). **This tool always needs
 account-admin access** (pass `--account-id` with account-admin credentials): even a propose-only /
-`--export` run performs account-level pre-checks (existing network policy + PrivateLink). No SQL
+`--export` run performs account-level pre-checks (existing network policy + PrivateLink). If the
+existing assigned policy can't be read, a run that would assign **aborts** (fail-closed); propose-only
+continues with a warning. No SQL
 warehouse is needed (no traffic analysis). It is a **single command** — there is no subcommand, so
 options go straight after the program name.
 
@@ -113,7 +115,9 @@ options go straight after the program name.
 
 ## Options
 
-- `--policy-mode` — **`enforce`** (default) or `dry_run` (log-only trial).
+- `--policy-mode` — **`enforce`** (default) or `dry_run` (log-only trial). **Overridden** (with a
+  warning) when the workspace's existing assigned CBI policy has restrictive rules — the new policy
+  inherits that policy's mode.
 - `--policy-name` — the new policy's id. If omitted you're **prompted** (blank there = the profile
   name; falls back to the workspace id). Normalised to a lowercase, `-`-safe, length-capped id.
 - `--export <path>` — write the proposed network-policy JSON (a curl / REST-ready
@@ -125,7 +129,8 @@ options go straight after the program name.
 - `--create-policy` / `--no-create-policy` — write the policy. **On by default** (a review gate still
   confirms). For a propose-only run use `--no-create-policy --no-auto-assign`.
 - `--disable-existing-ip-acls` — after create + assign, turn off the workspace's IP access lists;
-  requires create + assign **and** `--policy-mode enforce`. Off by default.
+  requires create + assign **and** `--policy-mode enforce`. Ignored (with a warning) when the new
+  policy inherits dry-run mode from the existing CBI policy. Off by default.
 - `--account-id` (+ account-admin creds) — account-level (pre-checks and create/assign). When unset it
   **defaults to the workspace profile's own `account_id`**, else prompts.
 - `--account-host` / `--account-profile` — account API host / a dedicated profile for account-level

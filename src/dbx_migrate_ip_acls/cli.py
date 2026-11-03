@@ -1025,7 +1025,11 @@ def migrate(
         help="Show the version and exit.",
     ),
     profile: str | None = typer.Option(None, help="Databricks CLI/config profile."),
-    policy_mode: Mode = typer.Option(Mode.enforce, help="enforce (default) or dry_run."),
+    policy_mode: Mode = typer.Option(
+        Mode.enforce,
+        help="enforce (default) or dry_run. Overridden (with a warning) when the workspace's existing "
+        "CBI policy has restrictive rules — the new policy inherits that policy's mode.",
+    ),
     policy_name: str = typer.Option(
         "",
         help="Policy id for the new policy. If omitted you'll be prompted (blank there = use the "
@@ -1036,7 +1040,8 @@ def migrate(
         False,
         help="After creating AND assigning the policy, disable this workspace's IP access "
         "lists (enableIpAccessLists=false). Requires --create-policy (assign is on by "
-        "default).",
+        "default) and --policy-mode enforce; ignored (with a warning) when the new policy "
+        "inherits dry-run mode from the existing CBI policy.",
     ),
     export: str = typer.Option(
         "",
