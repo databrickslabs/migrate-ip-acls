@@ -16,3 +16,6 @@ uv.lock
 .coverage
 coverage.xml
 htmlcov/
+
+# Local tool state
+.isaac/

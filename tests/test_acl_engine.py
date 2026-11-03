@@ -133,8 +133,8 @@ def test_build_preserves_existing_public_when_no_ip_acls():
 
 
 def test_build_restricted_private_includes_backend_endpoints():
-    # A RESTRICTED_ACCESS private block gates ALL private ingress, so the workspace's back-end
-    # PrivateLink endpoints (relay + REST — not in the PAS) must ride alongside the front-end ones.
+    # A RESTRICTED_ACCESS private block gates ALL private ingress, so the workspace's back-end REST
+    # API endpoint (not in the PAS) must ride alongside the front-end ones, as its own labelled rule.
     ws = _FakeWs([], ws_id=7)
     cfg = AclConfig()
     a = acl_core.analyze(cfg, ws)
@@ -149,8 +149,27 @@ def test_build_restricted_private_includes_backend_endpoints():
     assert rules[0]["label"] == "corp-pas"  # front-end verbatim
     assert rules[0]["origin"]["endpoints"]["endpoint_ids"] == ["el-frontend"]
     # back-end as its own clearly-labelled rule
-    assert rules[1]["label"] == "back-end private endpoints (data-plane relay + REST)"
+    assert rules[1]["label"] == "Classic compute REST API endpoint"
     assert rules[1]["origin"]["endpoints"]["endpoint_ids"] == ["el-relay", "el-rest"]
+
+
+def test_build_no_pas_plan_is_deny_all_private_plus_backend_rest():
+    # AWS/GCP with no PAS: no front-end endpoints at all; the only allow rule is the back-end REST API
+    # endpoint (when the network config has one). With none, the block has no allow rules.
+    ws = _FakeWs([], ws_id=7)
+    cfg = AclConfig()
+    a = acl_core.analyze(cfg, ws)
+    a.private_plan = acl_core.plan_without_pas()
+    a.private_plan.backend_endpoint_ids = ["el-rest"]
+    priv = acl_core.preview_block(a, cfg)["ingress"]["private_access"]
+    assert priv["restriction_mode"] == "RESTRICTED_ACCESS"
+    assert len(priv["allow_rules"]) == 1
+    assert priv["allow_rules"][0]["label"] == "Classic compute REST API endpoint"
+    assert priv["allow_rules"][0]["origin"]["endpoints"]["endpoint_ids"] == ["el-rest"]
+
+    a.private_plan = acl_core.plan_without_pas()  # no back-end PrivateLink either
+    priv = acl_core.preview_block(a, cfg)["ingress"]["private_access"]
+    assert priv["restriction_mode"] == "RESTRICTED_ACCESS" and "allow_rules" not in priv
 
 
 def test_build_backend_endpoints_deduped_against_frontend():
@@ -380,14 +399,20 @@ def _network_account(network_id="net-1", relay=None, rest=None, ws_raises=False,
     return type("Acct", (), {"workspaces": _WS(), "networks": _Networks()})()
 
 
-def test_backend_private_endpoint_ids_reads_relay_and_rest():
+def test_backend_private_endpoint_ids_reads_rest_only_ignoring_relay():
+    # The SCC relay endpoint carries the cluster tunnel, not workspace-API ingress — never included.
     acct = _network_account(relay=["el-relay"], rest=["el-rest"])
-    assert acl_core.backend_private_endpoint_ids(acct, 1) == ["el-relay", "el-rest"]
+    assert acl_core.backend_private_endpoint_ids(acct, 1) == ["el-rest"]
+
+
+def test_backend_private_endpoint_ids_relay_only_is_empty():
+    acct = _network_account(relay=["el-relay"], rest=None)
+    assert acl_core.backend_private_endpoint_ids(acct, 1) == []
 
 
 def test_backend_private_endpoint_ids_dedupes_preserving_order():
-    acct = _network_account(relay=["el-a", "el-b"], rest=["el-b", "el-c"])
-    assert acl_core.backend_private_endpoint_ids(acct, 1) == ["el-a", "el-b", "el-c"]
+    acct = _network_account(relay=["el-a"], rest=["el-b", "el-c", "el-b"])
+    assert acl_core.backend_private_endpoint_ids(acct, 1) == ["el-b", "el-c"]
 
 
 def test_backend_private_endpoint_ids_no_network_is_empty():
@@ -572,8 +597,9 @@ def test_plan_from_pas_account_level_allows_all_registered():
     assert public is True
     assert plan.restriction_mode == "ALLOW_ALL_REGISTERED_ENDPOINTS"
     assert plan.endpoint_ids == []
-    assert plan.label == "corp-pas"  # PAS name kept verbatim as the rule label
+    assert plan.label == "Inbound private endpoints"  # fixed, agreed label (PAS name shown separately)
     assert plan.source_pas_id == "pas-abc"
+    assert plan.from_pas is True
 
 
 def test_plan_from_pas_endpoint_level_enumerates_ids_and_reads_public_toggle():
@@ -583,12 +609,20 @@ def test_plan_from_pas_endpoint_level_enumerates_ids_and_reads_public_toggle():
     assert public is False  # public access disabled -> PrivateLink-only
     assert plan.restriction_mode == "RESTRICTED_ACCESS"
     assert plan.endpoint_ids == ["el-1", "el-2"]
-    assert plan.label == "registered-private-endpoints"  # fallback label when the PAS has no name
+    assert plan.label == "Inbound private endpoints"  # fixed label regardless of the PAS name
 
 
 def test_plan_from_pas_unspecified_level_defaults_to_allow_all():
     _public, plan = acl_core.plan_from_pas(_pas(level=None))
     assert plan.restriction_mode == "ALLOW_ALL_REGISTERED_ENDPOINTS"
+
+
+def test_plan_without_pas_is_restricted_with_no_endpoints():
+    # No PAS on AWS/GCP = no private endpoint can reach the workspace -> deny-all private, as-is.
+    plan = acl_core.plan_without_pas()
+    assert plan.restriction_mode == "RESTRICTED_ACCESS"
+    assert plan.endpoint_ids == [] and plan.backend_endpoint_ids == []
+    assert plan.from_pas is False and plan.source_pas_id is None
 
 
 def test_plan_from_pas_public_access_none_defaults_to_enabled():
@@ -692,6 +726,76 @@ def test_assigned_policy_returns_id_and_object():
     pol = object()
     assert acl_core.assigned_policy(_policy_account("p1", pol), 42) == ("p1", pol)
     assert acl_core.assigned_policy(_policy_account(None, None), 42) == (None, None)
+
+
+def test_assigned_ingress_mode_reads_where_the_restrictive_rules_live():
+    enforced = type(
+        "P", (), {"ingress": _ingress(public_mode="RESTRICTED_ACCESS"), "ingress_dry_run": None}
+    )()
+    dry = type("P", (), {"ingress": None, "ingress_dry_run": _ingress(private_mode="RESTRICTED_ACCESS")})()
+    allow_all = type("P", (), {"ingress": _ingress(), "ingress_dry_run": None})()
+    assert acl_core.assigned_ingress_mode(enforced) == "enforce"
+    assert acl_core.assigned_ingress_mode(dry) == "dry_run"
+    assert acl_core.assigned_ingress_mode(allow_all) is None  # permissive baseline: no mode to inherit
+    assert acl_core.assigned_ingress_mode(None) is None
+
+
+def _flaky_policy_account(assigned_policy_id, policy_obj, option_failures=0, policy_failures=0):
+    """Like _policy_account, but the first `option_failures` network-option reads and the first
+    `policy_failures` policy reads raise (transient account-API errors)."""
+    calls = {"opt": 0, "pol": 0}
+
+    class _WNC:
+        def get_workspace_network_option_rpc(self, workspace_id):
+            calls["opt"] += 1
+            if calls["opt"] <= option_failures:
+                raise RuntimeError("503 upstream")
+            return type("O", (), {"network_policy_id": assigned_policy_id})()
+
+    class _NP:
+        def get_network_policy_rpc(self, network_policy_id):
+            calls["pol"] += 1
+            if calls["pol"] <= policy_failures:
+                raise RuntimeError("503 upstream")
+            return policy_obj
+
+    acct = type("Acct", (), {"workspace_network_configuration": _WNC(), "network_policies": _NP()})()
+    return acct, calls
+
+
+def test_assigned_policy_state_unassigned_is_not_an_error():
+    s = acl_core.assigned_policy_state(_policy_account(None, None), 42)
+    assert (s.policy_id, s.policy, s.read_error) == (None, None, None)
+
+
+def test_assigned_policy_state_retries_a_transient_option_failure():
+    pol = object()
+    acct, calls = _flaky_policy_account("p1", pol, option_failures=1)
+    s = acl_core.assigned_policy_state(acct, 42)
+    assert (s.policy_id, s.policy, s.read_error) == ("p1", pol, None)
+    assert calls["opt"] == 2  # failed once, succeeded on the retry
+
+
+def test_assigned_policy_state_reports_persistent_option_failure():
+    acct, calls = _flaky_policy_account("p1", object(), option_failures=5)
+    s = acl_core.assigned_policy_state(acct, 42)
+    assert s.policy is None and s.policy_id is None
+    assert s.read_error and "workspace network option" in s.read_error and "503" in s.read_error
+    assert calls["opt"] == 2  # exactly one retry
+
+
+def test_assigned_policy_state_reports_policy_read_failure_with_id():
+    acct, calls = _flaky_policy_account("p1", object(), policy_failures=5)
+    s = acl_core.assigned_policy_state(acct, 42)
+    assert s.policy_id == "p1" and s.policy is None
+    assert s.read_error and "network policy 'p1'" in s.read_error
+    assert calls["pol"] == 2
+
+
+def test_assigned_policy_wrapper_keeps_best_effort_shape():
+    # the legacy tuple view degrades silently (used by tests/readers); the CLI uses the state object
+    acct, _ = _flaky_policy_account("p1", object(), option_failures=5)
+    assert acl_core.assigned_policy(acct, 42) == (None, None)
 
 
 def test_existing_cbi_ingress_none_when_unassigned():

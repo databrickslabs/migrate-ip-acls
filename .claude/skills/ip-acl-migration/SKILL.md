@@ -1,6 +1,6 @@
 ---
 name: ip-acl-migration
-description: Migrate a Databricks workspace's existing IP access list (ACL) — and its front-end PrivateLink on AWS / GCP — into a context-based ingress (CBI) account network policy, as-is, using the dbx-migrate-ip-acls CLI. Use when the user wants to convert / migrate an existing IP access list to a network policy, recreate their IP ACL as CBI, migrate a front-end PrivateLink / PrivateLink-only workspace, or stand up a network policy from the current ACL without audit-log analysis. Runs `dbx-migrate-ip-acls`, which reads this workspace's ACL (ALLOW->allow rules, BLOCK->deny rules) and, on AWS / GCP, its Private Access Settings (PrivateLink), recreates them verbatim — nothing added — then creates the account network policy (enforce or dry-run) and optionally auto-assigns it to the current workspace.
+description: Migrate a Databricks workspace's existing IP access list (ACL) — and its legacy private access (front-end PrivateLink / PSC, or its absence) on AWS / GCP — into a context-based ingress (CBI) account network policy, as-is, using the dbx-migrate-ip-acls CLI. Use when the user wants to convert / migrate an existing IP access list to a network policy, recreate their IP ACL as CBI, migrate a front-end PrivateLink / PrivateLink-only workspace, or stand up a network policy from the current ACL without audit-log analysis. Runs `dbx-migrate-ip-acls`, which reads this workspace's ACL (ALLOW->allow rules, BLOCK->deny rules) and, on AWS / GCP, its Private Access Settings (PrivateLink), recreates them verbatim — nothing added — then creates the account network policy (enforce or dry-run) and optionally auto-assigns it to the current workspace.
 ---
 
 # IP Access List → CBI migration
@@ -22,7 +22,9 @@ IP ACL as CBI, or create a network policy from the current ACL without analysing
 `uv sync`, then `uv run dbx-migrate-ip-acls …` (or `uv tool install .` then `dbx-migrate-ip-acls …`).
 Auth is the SDK's unified auth (`--profile` or `DATABRICKS_*`). **This tool always needs
 account-admin access** (pass `--account-id` with account-admin credentials): even a propose-only /
-`--export` run performs account-level pre-checks (existing network policy + PrivateLink). No SQL
+`--export` run performs account-level pre-checks (existing network policy + PrivateLink). If the
+existing assigned policy can't be read, a run that would assign **aborts** (fail-closed); propose-only
+continues with a warning. No SQL
 warehouse is needed (no traffic analysis). It is a **single command** — there is no subcommand, so
 options go straight after the program name.
 
@@ -34,17 +36,19 @@ options go straight after the program name.
    master toggle is on *and* the list is enabled. Master off ⇒ the lists are **dormant** (not
    enforced) even if individual lists show `enabled=true`, so they are **not** migrated.
    - **master on + 1+ rules** → migrate them. (Unreadable toggle → warn + treat as on.)
-   - **master on + 0 rules** → nothing to migrate → **exit** (unless there's front-end PrivateLink).
+   - **master on + 0 rules** → nothing to migrate → **exit** (unless there's legacy private access to migrate — on AWS / GCP
+     there always is, so only Azure exits here).
    - **master off** → dormant. When there are rules and the run can write (create mode, interactive),
      it **prints the current config** and **offers to re-enable** enforcement (independent of
      PrivateLink): **yes** → sets `enableIpAccessLists=true` and migrates the now-active lists; **no**
      → dormant lists are **not** migrated. `--yes` / propose-only can't re-enable, so they never
-     migrate dormant lists. Front-end PrivateLink (if any) is still migrated and the existing CBI
+     migrate dormant lists. Legacy private access (AWS / GCP) is still migrated and the existing CBI
      public is **preserved**; if nothing is active at all → **exit**. `--yes` never auto-flips the
      toggle.
 
-   So the "nothing to migrate" exits also don't fire when there's front-end PrivateLink to migrate
-   (step 2) — a PrivateLink-only / 0-rule workspace still proceeds on the private access alone.
+   So the "nothing to migrate" exits also don't fire when there's legacy private access to migrate
+   (step 3) — on AWS / GCP there always is (a PAS, or its absence = deny-all), so a PrivateLink-only
+   or 0-rule workspace still proceeds on the private access alone; only Azure exits.
 2. Reads the workspace's IP access lists (`w.ip_access_lists.list()`). **Individual lists that are
    disabled are flagged and NOT migrated** — only enabled lists are; the disabled ones are called out
    in the final printout (below the old + new policy) so you can vet them. Maps **ALLOW lists → allow
@@ -60,8 +64,14 @@ options go straight after the program name.
      step 2): `private_access_level=ACCOUNT` → `ALLOW_ALL_REGISTERED_ENDPOINTS`; `ENDPOINT` → a
      `RESTRICTED_ACCESS` private rule listing the PAS's registered endpoint ids. If the PAS has
      **public access disabled** (PrivateLink-only), the IP access lists aren't recreated as public
-     rules (they aren't in effect) and the `public_access` block becomes an explicit **deny-all**. No
-     PAS → public-only, as before. The PAS and the public toggle are **read, never modified**.
+     rules (they aren't in effect) and the `public_access` block becomes an explicit **deny-all**.
+     **No PAS → deny-all private**: a PAS is required for any PrivateLink connectivity, so without one
+     no private endpoint can reach the workspace, and `private_access` becomes `RESTRICTED_ACCESS`
+     with no front-end endpoints (not "nothing to migrate"). The PAS and the public toggle are
+     **read, never modified**. Whenever the private block is `RESTRICTED_ACCESS`, the workspace's
+     classic compute REST API endpoint (from `network.vpc_endpoints.rest_api`, not the PAS) is added as
+     a second allow rule, `Classic compute REST API endpoint`; the PAS rule is labelled
+     `Inbound private endpoints`. The SCC relay endpoint is not included.
    - **GCP — PAS attached (PSC)?** GCP front-end PrivateLink is Private Service Connect (PSC),
      surfaced through the same PAS object, so it's **migrated as-is** exactly like AWS (the mapping is
      cloud-agnostic).
@@ -74,10 +84,15 @@ options go straight after the program name.
      verbatim) the workspace's existing assigned CBI block (`public_access` / `private_access` /
      `cross_workspace_access`) — so e.g. migrating IP ACLs → public keeps existing CBI private rules.
      Only when the run will **assign** does it **abort** on a true same-dimension collision: a legacy
-     public source (IP ACLs / PAS public toggle) over a **restrictive** CBI *public* block, or an
-     endpoint-scoped PAS over a **restrictive** CBI *private* block. Allow-all blocks (e.g. the
-     baseline `default-policy`) never collide; an account-level (allow-all) PAS never loosens a
-     stricter existing CBI private policy. When **not** assigning, it just **warns**.
+     public source (IP ACLs / PAS public toggle) over a **restrictive** CBI *public* block, or a
+     restrictive legacy private posture (endpoint-scoped PAS, or no PAS on AWS / GCP) over a
+     **restrictive** CBI *private* block. Allow-all blocks (e.g. the baseline `default-policy`) never
+     collide; an account-level (allow-all) PAS never loosens a stricter existing CBI private policy.
+     When **not** assigning, it just **warns**.
+   - **Enforcement mode is inherited.** If the existing assigned CBI policy has restrictive rules that
+     are carried over, the new policy is created in that policy's mode (dry run / enforced) and
+     `--policy-mode` is ignored with a warning; when the inherited mode is dry run,
+     `--disable-existing-ip-acls` is ignored too (a dry-run policy blocks nothing).
 4. Names the new policy from `--policy-name`; if not given it **prompts** for one (leave blank there
    to use the profile name). It only **creates new** policies, so if the chosen name already exists it
    re-prompts (interactively) or aborts. `--create-policy` is **on by default** (an interactive review
@@ -91,7 +106,7 @@ options go straight after the program name.
 
 > This tool deliberately does **not** auto-allow Databricks' own control-plane IPs or do any
 > enrichment — it assumes the existing ACL is what the customer wants. It migrates the **ingress**
-> (the IP ACLs, plus front-end PrivateLink on AWS / GCP) and, for **egress**, copies the egress block of the policy the workspace currently
+> (the IP ACLs, plus legacy private access on AWS / GCP) and, for **egress**, copies the egress block of the policy the workspace currently
 > runs under **verbatim** — its enforcement mode, allowed internet (FQDN) + storage destinations, and
 > blocked-internet lists — so egress posture is preserved rather than reset. The source is the
 > workspace's assigned policy, or the account baseline `default-policy` when nothing is assigned; only
@@ -100,7 +115,9 @@ options go straight after the program name.
 
 ## Options
 
-- `--policy-mode` — **`enforce`** (default) or `dry_run` (log-only trial).
+- `--policy-mode` — **`enforce`** (default) or `dry_run` (log-only trial). **Overridden** (with a
+  warning) when the workspace's existing assigned CBI policy has restrictive rules — the new policy
+  inherits that policy's mode.
 - `--policy-name` — the new policy's id. If omitted you're **prompted** (blank there = the profile
   name; falls back to the workspace id). Normalised to a lowercase, `-`-safe, length-capped id.
 - `--export <path>` — write the proposed network-policy JSON (a curl / REST-ready
@@ -112,7 +129,8 @@ options go straight after the program name.
 - `--create-policy` / `--no-create-policy` — write the policy. **On by default** (a review gate still
   confirms). For a propose-only run use `--no-create-policy --no-auto-assign`.
 - `--disable-existing-ip-acls` — after create + assign, turn off the workspace's IP access lists;
-  requires create + assign **and** `--policy-mode enforce`. Off by default.
+  requires create + assign **and** `--policy-mode enforce`. Ignored (with a warning) when the new
+  policy inherits dry-run mode from the existing CBI policy. Off by default.
 - `--account-id` (+ account-admin creds) — account-level (pre-checks and create/assign). When unset it
   **defaults to the workspace profile's own `account_id`**, else prompts.
 - `--account-host` / `--account-profile` — account API host / a dedicated profile for account-level

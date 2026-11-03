@@ -14,6 +14,50 @@ commit `vX.Y.Z` — which the release workflow then publishes to PyPI. See
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-03
+
+Behaviour changes agreed with the CBI product team; flag surface unchanged (minor bump).
+
+### Changed
+
+- **No Private Access Settings (AWS / GCP) is migrated as deny-all private access.** A PAS is
+  required for any PrivateLink / PSC connectivity to a workspace, so a workspace with no PAS attached
+  can't be reached by any private endpoint today. Previously the tool treated that as "nothing to
+  migrate for private" and left the generated policy's `private_access` to the CBI default (allow all
+  registered endpoints) or to whatever the existing CBI policy had — a loosening. Now the legacy
+  posture is recreated as-is: `private_access` becomes `RESTRICTED_ACCESS` with no front-end
+  endpoints (plus the classic compute REST API endpoint, if the network config has one). This also
+  means a no-PAS AWS / GCP workspace with no IP access lists is no longer "nothing to migrate" — the
+  policy is still generated for its private access. The same-dimension conflict gate applies: no PAS
+  over an existing **restrictive** CBI private block aborts (when assigning), exactly like an
+  endpoint-scoped PAS. On a cloud the tool can't determine, the mapping isn't applied and it warns.
+- **Enforcement mode is inherited from the existing CBI policy.** A network policy supports a single
+  enforcement mode, so when the workspace's existing assigned CBI policy has restrictive ingress rules
+  (public, private or cross-workspace) that are carried into the new policy, the new policy is created
+  in that policy's mode — dry run or enforced — and `--policy-mode` is ignored with a warning if it
+  differs. When the inherited mode is dry run, `--disable-existing-ip-acls` is also ignored (with a
+  warning): a dry-run policy blocks nothing, so the legacy IP access lists must stay on. When the
+  existing policy has no restrictive rules, `--policy-mode` applies as before.
+- **Back-end private rule is the REST API endpoint only.** The second private allow rule now lists
+  the workspace's classic compute REST API endpoint(s) from `network.vpc_endpoints.rest_api`; the SCC
+  relay endpoint (`dataplane_relay`) is no longer included — it carries the cluster tunnel, not
+  workspace-API ingress, so the ingress policy never evaluates it.
+- **Fixed private-rule labels.** The PAS-derived front-end rule is now labelled
+  `Inbound private endpoints` (previously the PAS name) and the back-end rule
+  `Classic compute REST API endpoint` (previously `back-end private endpoints (data-plane relay +
+  REST)`). The PAS name is still shown in the console. IP access list rule labels remain verbatim.
+
+### Fixed
+
+- **A failed read of the workspace's assigned policy no longer passes as "nothing assigned".** The
+  conflict gate, enforcement-mode inheritance and egress copy all depend on that read; previously any
+  error was swallowed and the run proceeded as if no policy were assigned, so a transient account-API
+  failure could let a create + assign silently replace a restrictive policy. The read is now retried
+  once and, if it still fails, a run that would **assign** aborts with a clear message; propose-only
+  and create-only runs continue with a warning that the preview can't account for the existing policy.
+- Removed an unreachable branch and stale references left over from the sibling tool; the workspace
+  id and the assigned network policy are each read once per run instead of twice. No behaviour change.
+
 ## [0.2.2] - 2026-10-27
 
 ### Changed
@@ -112,7 +156,8 @@ enrichment.
   working in propose-only mode.
 - **`--version`.** `dbx-migrate-ip-acls --version` reports the tool version.
 
-[Unreleased]: https://github.com/databrickslabs/migrate-ip-acls/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/databrickslabs/migrate-ip-acls/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/databrickslabs/migrate-ip-acls/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/databrickslabs/migrate-ip-acls/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/databrickslabs/migrate-ip-acls/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/databrickslabs/migrate-ip-acls/compare/v0.1.0...v0.2.0
